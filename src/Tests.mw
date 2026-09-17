@@ -1,0 +1,339 @@
+-- The port against the crate: every case in `Cases.mw`, whose expected results
+-- came from calling insta itself, plus a few examples.
+--
+-- Every declaration carries `@cfg(test)`, as the tests are no part of the
+-- package.
+
+@cfg(test)
+use Std.Test (assertEq, fail)
+@cfg(test)
+use Std.Collections.Vector as V
+@cfg(test)
+use Std.String as S
+@cfg(test)
+use Std.Fs (writeString, createDirAll, removeDirAll, readToString, exists)
+@cfg(test)
+use Std.Console (withOutput)
+@cfg(test)
+use insta.Cases (cases)
+@cfg(test)
+use insta.Yaml
+@cfg(test)
+use insta.Snapshot
+@cfg(test)
+use insta.Runtime
+
+-- --- reading -------------------------------------------------------------------------------
+
+@cfg(test)
+fun num i n =
+  let rec go k acc = if k >= n then acc else go (k + 1) (acc * 64 + (toInt (stringByteAt cases (i + k)) - 48)) in
+  (go 0 0, i + n)
+
+@cfg(test)
+fun str i =
+  let len = fst (num i 3) in
+  (stringSlice cases (i + 3) (i + 3 + len), i + 3 + len)
+
+@cfg(test)
+fun flag i =
+  match num i 1 with
+  | (n, next) -> (n == 1, next)
+
+@cfg(test)
+fun decimal s =
+  let negative = S.startsWith "-" s in
+  let body = if negative then S.drop s 1 else s in
+  let digitAt = \k -> toBigInt (toInt (stringByteAt body k) - 48) in
+  let rec go k acc = if k >= stringByteLength body then acc else go (k + 1) (acc * toBigInt 10 + digitAt k) in
+  let n = go 0 (toBigInt 0) in
+  toInt (if negative then toBigInt 0 - n else n)
+
+-- Reads `count` things with `read`, from `i`.
+@cfg(test)
+fun many count i read =
+  let rec go k at acc =
+    if k >= count
+    then (acc, at)
+    else
+      match read at with
+      | (x, next) -> go (k + 1) next (V.pushBack acc x)
+  in
+  go 0 i V.empty
+
+@cfg(test)
+fun readYaml i =
+  match num i 1 with
+  | (0, next) -> (Yaml.Null, next)
+  | (1, next) ->
+      (match flag next with
+       | (b, after) -> (Yaml.Boolean b, after))
+  | (2, next) ->
+      (match str next with
+       | (t, after) -> (Yaml.Integer (decimal t), after))
+  | (3, next) ->
+      (match str next with
+       | (t, after) -> (Yaml.Str t, after))
+  | (4, next) ->
+      let count = num next 1 in
+      (match many (fst count) (snd count) readYaml with
+       | (items, after) -> (Yaml.Seq items, after))
+  | (_, next) ->
+      let count = num next 1 in
+      let entry = \at ->
+        match str at with
+        | (k, afterKey) ->
+            match readYaml afterKey with
+            | (v, afterValue) -> ((Yaml.Str k, v), afterValue)
+      in
+      match many (fst count) (snd count) entry with
+      | (entries, after) -> (Yaml.Hash entries, after)
+
+-- --- Rust's `Debug`, for the strings the cases print -------------------------------------
+
+@cfg(test)
+fun hex n =
+  let digits = "0123456789abcdef" in
+  let rec go m acc = if m == 0 then acc else go (m / 16) (stringSlice digits (m % 16) (m % 16 + 1) ++ acc) in
+  if n == 0 then "0" else go n ""
+
+@cfg(test)
+fun debugString s =
+  let escape = \c ->
+    let cp = charCode c in
+    if cp == 0
+    then "\\0"
+    else if cp == 9
+    then "\\t"
+    else if cp == 10
+    then "\\n"
+    else if cp == 13
+    then "\\r"
+    else if cp == 34
+    then "\\\""
+    else if cp == 92
+    then "\\\\"
+    else if cp < 32 or (cp >= 127 and cp < 160)
+    then "\\u{${hex cp}}"
+    else charsToString #[c]
+  in
+  "\"" ++ S.join "" (V.map escape (V.fromArray (stringToChars s))) ++ "\""
+
+@cfg(test)
+fun debugMaybe m =
+  match m with
+  | Just s -> "Some(${debugString s})"
+  | None -> "None"
+
+@cfg(test)
+fun debugMaybeInt m =
+  match m with
+  | Just n -> "Some(${n})"
+  | None -> "None"
+
+-- --- the cases -----------------------------------------------------------------------------
+
+-- Kind 0: YAML as the emitter writes it.
+@cfg(test)
+fun yamlCase i =
+  match readYaml i with
+  | (y, next) ->
+      let plain = str next in
+      let blocks = str (snd plain) in
+      ([fst plain, fst blocks], [S.drop (toYaml y) 4, S.drop (toYamlWith True y) 4], snd blocks)
+
+@cfg(test)
+fun report path text =
+  match parseSnapshot path text with
+  | Ok (s : Snapshot) ->
+      let (m : MetaData) = s.metadata in
+      let info =
+        match m.info with
+        | Just y -> S.drop (toYaml y) 4
+        | None -> "none"
+      in
+      [ "ok",
+        "name ${debugMaybe s.snapshotName} module ${debugString s.moduleName}",
+        "source ${debugMaybe m.source}",
+        "line ${debugMaybeInt m.assertionLine}",
+        "expression ${debugMaybe m.expression}",
+        "description ${debugMaybe (descriptionOf m)}",
+        "input ${debugMaybe m.inputFile}",
+        "info ${info}",
+        "contents ${debugString (contentsText s.contents)}" ]
+  | Err e -> ["error", e]
+
+-- Kind 1: snapshot files read back.
+@cfg(test)
+fun fileCase i =
+  let name = str i in
+  let text = str (snd name) in
+  let count = num (snd text) 1 in
+  match many (fst count) (snd count) str with
+  | (want, next) ->
+      let wanted = V.map (\l -> S.join "<file>" (S.split "\"" l)) want in
+      ignoreFileErrorPath wanted (report (fst name) (fst text)) next
+
+-- The crate names the file it failed to parse by its whole path; the port is
+-- given only its name.
+@cfg(test)
+fun ignoreFileErrorPath want got next =
+  let normalize = \lines ->
+    let one = \l ->
+      if S.startsWith "Failed parsing the YAML from" l
+      then "Failed parsing the YAML"
+      else S.join "<file>" (S.split "\"" l)
+    in
+    V.map one lines
+  in
+  (normalize want, normalize got, next)
+
+@cfg(test)
+fun bit b = if b then "1" else "0"
+
+-- Kind 2: contents compared, and written as inline literals.
+@cfg(test)
+fun contentsCase i =
+  let a = str i in
+  let b = str (snd a) in
+  let ka = flag (snd b) in
+  let kb = flag (snd ka) in
+  let indent = str (snd kb) in
+  let shown = str (snd indent) in
+  let latest = flag (snd shown) in
+  let legacy = flag (snd latest) in
+  let fully = flag (snd legacy) in
+  let inline = str (snd fully) in
+  let kind = \k -> if k then TextKind.Inline else TextKind.File in
+  let ca = contents (fst a) (kind (fst ka)) in
+  let cb = contents (fst b) (kind (fst kb)) in
+  let want = [fst shown, bit (fst latest) ++ bit (fst legacy) ++ bit (fst fully), fst inline] in
+  let matching = bit (matchesLatest ca cb) ++ bit (matchesLegacy ca cb) ++ bit (matchesFully ca cb) in
+  let got = [contentsText ca, matching, toInline (fst indent) ca] in
+  (want, got, snd inline)
+
+-- --- assertions ----------------------------------------------------------------------------
+
+@cfg(test)
+def workspace = "target/insta-cases/job"
+
+@cfg(test)
+def managedVariables =
+  [ "INSTA_UPDATE", "INSTA_OUTPUT", "INSTA_FORCE_PASS", "INSTA_REQUIRE_FULL_MATCH", "INSTA_YAML_BLOCK_STYLE",
+    "CLICOLOR_FORCE", "CI", "TF_BUILD", "INSTA_PENDING_DIR", "INSTA_FORCE_UPDATE", "INSTA_FORCE_UPDATE_SNAPSHOTS" ]
+
+-- Runs `act`, turning a test failure into its message.
+@cfg(test)
+fun catching act =
+  handle act () with {
+    fail message k -> Err message,
+    return x -> Ok x
+  }
+
+@cfg(test)
+fun readOr path = if exists path then (match readToString path with | Ok t -> t | Err _ -> "<none>") else "<none>"
+
+@cfg(test)
+fun assertionCase i =
+  let name = str i in
+  let modulePath = str (snd name) in
+  let suffix = flag (snd modulePath) in
+  let described = flag (snd suffix) in
+  let description =
+    if fst described then (match str (snd described) with | (d, n) -> (Just d, n)) else (None, snd described)
+  in
+  let omit = flag (snd description) in
+  let hasInfo = flag (snd omit) in
+  let info = if fst hasInfo then (match readYaml (snd hasInfo) with | (y, n) -> (Just y, n)) else (None, snd hasInfo) in
+  let expression = str (snd info) in
+  let line = num (snd expression) 2 in
+  let value = str (snd line) in
+  let hasOld = flag (snd value) in
+  let old = if fst hasOld then (match str (snd hasOld) with | (o, n) -> (Just o, n)) else (None, snd hasOld) in
+  let stale = flag (snd old) in
+  let sourceExists = flag (snd stale) in
+  let envCount = num (snd sourceExists) 1 in
+  let pair = \at -> match str at with | (k, n) -> (match str n with | (v, n2) -> ((k, v), n2)) in
+  match many (fst envCount) (snd envCount) pair with
+  | (env, afterEnv) ->
+      let output = str afterEnv in
+      let snapText = str (snd output) in
+      let newText = str (snd snapText) in
+      -- Lay out the workspace as the generator did.
+      let _ = removeDirAll workspace in
+      let _ = createDirAll (workspace ++ "/src/snapshots") in
+      let _ = if fst sourceExists then writeString (workspace ++ "/src/lib.rs", "// test\n") else Ok () in
+      let base = settings () in
+      let placed =
+        { base |
+          workspace = workspace,
+          sourceFile = Just "src/lib.rs",
+          modulePath = if fst modulePath == "" then None else Just (fst modulePath),
+          snapshotSuffix = if fst suffix then Just "v2" else None }
+      in
+      let file = snapshotFile placed (fst name) in
+      let _ =
+        match fst old with
+        | Just o -> writeString (file, o)
+        | None -> Ok ()
+      in
+      let _ = if fst stale then writeString (file ++ ".new", "stale") else Ok () in
+      -- The environment, and nothing else of insta's.
+      let _ = V.map (\v -> removeEnv v) managedVariables in
+      let _ = V.map (\kv -> match kv with | (k, v) -> setEnv (k, v)) env in
+      let _ = setEnv ("INSTA_WORKSPACE_ROOT", workspace) in
+      let fresh = settings () in
+      let s =
+        { fresh |
+          workspace = workspace,
+          sourceFile = Just "src/lib.rs",
+          modulePath = placed.modulePath,
+          snapshotSuffix = placed.snapshotSuffix,
+          description = fst description,
+          omitExpression = fst omit,
+          info = fst info,
+          line = Just (fst line),
+          reviewHint = "To update snapshots run `cargo insta review`",
+          stopHint = "Stopped on the first failure. Run `cargo insta test` to run all snapshots." }
+      in
+      let assertion = \() -> assertSnapshotWith s (fst name) (Just (fst expression)) (fst value) in
+      let ran = withOutput (\() -> catching assertion) in
+      let printed =
+        match ran with
+        | (Err message, text) -> text ++ "@@PANIC ${message}\n"
+        | (Ok _, text) -> text
+      in
+      let got = [S.join "<WS>" (S.split workspace printed), readOr file, readOr (file ++ ".new")] in
+      let _ = V.map (\v -> removeEnv v) managedVariables in
+      let _ = removeEnv "INSTA_WORKSPACE_ROOT" in
+      ([fst output, fst snapText, fst newText], got, snd newText)
+
+@cfg(test)
+fun runCase i =
+  let kind = num i 1 in
+  match fst kind with
+  | 0 -> yamlCase (snd kind)
+  | 1 -> fileCase (snd kind)
+  | 2 -> contentsCase (snd kind)
+  | _ -> assertionCase (snd kind)
+
+@cfg(test)
+fun check i n bad =
+  if i >= stringByteLength cases
+  then (n, bad)
+  else
+    match runCase i with
+    | (want, got, next) -> check next (n + 1) (if want == got then bad else V.pushBack bad (n, want, got))
+
+-- The number of cases, and the first few where the port differs.
+@cfg(test)
+@test fun resultsMatchTheCrate () =
+  match check 0 0 V.empty with
+  | (n, bad) -> assertEq (n, V.take bad 2) (1930, []) "cases where the port and insta differ"
+
+@cfg(test)
+@test fun examples () =
+  let keyword = toYaml (Yaml.Hash [(Yaml.Str "source", Yaml.Str "yes")]) in
+  let a = assertEq keyword "---\nsource: \"yes\"\n" "quoted keyword" in
+  let b = assertEq (contentsText (fromInlineLiteral "\n    a\n    b\n")) "a\nb" "inline literal" in
+  assertEq (normalizeInline "\n  x\n  y") "\nx\ny" "indentation removed"

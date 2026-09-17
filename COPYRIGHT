@@ -1,0 +1,10 @@
+insta (the Meadow package) is a port of the Rust crate insta
+(https://github.com/mitsuhiko/insta), version 1.48.0, by Armin Ronacher and
+contributors, to Meadow. It includes a port of the YAML emitter and reader
+insta vendors from yaml-rust (https://github.com/chyh1990/yaml-rust), by
+Yuheng Chen and contributors, and prints with the styles of the console crate
+(https://github.com/console-rs/console). Its test cases are generated from
+insta, and its code is translated from its source.
+
+insta and its vendored yaml-rust are licensed under the Apache License,
+Version 2.0, and so is this port: see LICENSE.

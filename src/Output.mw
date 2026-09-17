@@ -1,0 +1,365 @@
+-- What insta prints about a snapshot: a summary, the contents, or a diff
+-- against the old snapshot. The crate's `src/output.rs`, with the styles of
+-- the `console` crate it prints with.
+--
+-- Copyright Armin Ronacher and the insta contributors, and the Meadow port's
+-- authors. Licensed under Apache-2.0: see LICENSE and COPYRIGHT.
+
+use Std.Collections.Vector as V
+use Std.String as S
+use diff (diffLines, textDiffConfig, groupedOps, iterInlineChangesByWords, InlineChange, inlineMissingNewline, Patience)
+use diff (ChangeTag, DiffOp)
+use insta.Yaml (toYaml)
+use insta.Snapshot
+
+-- --- styles --------------------------------------------------------------------------------
+
+-- A colour and attributes, as `console::Style` has them: the colour's ANSI
+-- number, and the attributes bold, dim, italic and underlined as SGR codes.
+record Style = { color : Maybe Int, attrs : [Int] }
+
+def plain = Style { color = None, attrs = [] }
+
+fun cyan (s : Style) = { s | color = Just 6 }
+
+fun red (s : Style) = { s | color = Just 1 }
+
+fun green (s : Style) = { s | color = Just 2 }
+
+fun yellow (s : Style) = { s | color = Just 3 }
+
+fun addAttr code (s : Style) = if V.elem code s.attrs then s else { s | attrs = V.pushBack s.attrs code }
+
+fun bold s = addAttr 1 s
+
+fun dim s = addAttr 2 s
+
+fun underlined s = addAttr 4 s
+
+-- `text` in `style`, if colours are on: the colour, the attributes in their
+-- order, the text, and a reset.
+fun paint colors (style : Style) text =
+  if not colors or (style.color == None and V.isEmpty style.attrs)
+  then text
+  else
+    let color =
+      match style.color with
+      | Just n -> "\u{1b}[${30 + n}m"
+      | None -> ""
+    in
+    let attrs = S.join "" (V.map (\a -> "\u{1b}[${a}m") (V.filter (\a -> V.elem a style.attrs) [1, 2, 3, 4])) in
+    color ++ attrs ++ text ++ "\u{1b}[0m"
+
+fun charCount s = arrayLen (stringToChars s)
+
+-- `text` right-aligned in `width` characters.
+fun padLeft width text = S.repeat " " (width - charCount text) ++ text
+
+-- `text` centred in `width` characters of `fill`, the odd one after.
+fun center width fill text =
+  let pad = width - charCount text in
+  if pad <= 0 then text else S.repeat fill (pad / 2) ++ text ++ S.repeat fill (pad - pad / 2)
+
+fun sat a b = if a > b then a - b else 0
+
+-- --- the printer ---------------------------------------------------------------------------
+
+-- What to print, and how.
+@pub record Printer = {
+  workspace : String,
+  old : Maybe Snapshot,
+  new : Snapshot,
+  oldHint : String,
+  newHint : String,
+  showInfo : Bool,
+  showDiff : Bool,
+  title : Maybe String,
+  line : Maybe Int,
+  snapshotFile : Maybe String,
+  -- Whether to print ANSI colours.
+  colors : Bool,
+  -- The terminal's width.
+  width : Int,
+  -- Whether the snapshot's source file exists: it is shown relative to the
+  -- workspace only if it does, as the crate finds by canonicalizing it.
+  sourceExists : Bool
+}
+
+-- A printer for `new` against `old`, in `workspace`, as the crate makes one.
+@pub fun printer workspace old new =
+  Printer {
+    workspace = workspace,
+    old = old,
+    new = new,
+    oldHint = "old snapshot",
+    newHint = "new results",
+    showInfo = False,
+    showDiff = False,
+    title = None,
+    line = None,
+    snapshotFile = None,
+    colors = False,
+    width = 80,
+    sourceExists = False
+  }
+
+fun joinPath base rest =
+  if base == "" or S.startsWith "/" rest
+  then rest
+  else if S.endsWith "/" base
+  then base ++ rest
+  else base ++ "/" ++ rest
+
+-- `path` without `base` in front, if it is under `base`.
+fun stripBase base path =
+  let prefix = if S.endsWith "/" base then base else base ++ "/" in
+  if path == base
+  then Just ""
+  else if S.startsWith prefix path
+  then Just (S.drop path (stringByteLength prefix))
+  else None
+
+-- `path` with `.` and `..` resolved as far as they go.
+fun lexical path =
+  let absolute = S.startsWith "/" path in
+  let step = \acc part ->
+    if part == "" or part == "."
+    then acc
+    else if part == ".."
+    then
+      let atTop = V.isEmpty acc or V.getOr "" acc (V.len acc - 1) == ".." in
+      if not atTop then V.take acc (V.len acc - 1) else if absolute then acc else V.pushBack acc part
+    else V.pushBack acc part
+  in
+  let parts = V.foldl step V.empty (S.split "/" path) in
+  (if absolute then "/" else "") ++ S.join "/" parts
+
+-- The source, relative to the workspace: the crate canonicalizes the joined
+-- path, and falls back to the workspace itself when that fails.
+fun relativeSource (p : Printer) source =
+  let joined = joinPath p.workspace source in
+  if p.sourceExists
+  then
+    match stripBase p.workspace (lexical joined) with
+    | Just rest -> rest
+    | None -> p.workspace
+  else p.workspace
+
+fun summary (p : Printer) =
+  let s = p.new in
+  let fileLine =
+    match p.snapshotFile with
+    | Just file ->
+        let shown =
+          match stripBase p.workspace file with
+          | Just rest -> rest
+          | None ->
+              match stripBase p.workspace (joinPath p.workspace file) with
+              | Just rest -> rest
+              | None -> file
+        in
+        ["Snapshot file: " ++ paint p.colors (underlined (cyan plain)) shown]
+    | None -> []
+  in
+  let nameLine =
+    match s.snapshotName with
+    | Just name -> "Snapshot: " ++ paint p.colors (yellow plain) name
+    | None -> "Snapshot: " ++ paint p.colors (dim plain) "<inline>"
+  in
+  let (m : MetaData) = s.metadata in
+  let sourceLine =
+    match m.source with
+    | Just source ->
+        let lineNumber =
+          match p.line with
+          | Just n -> Just n
+          | None -> m.assertionLine
+        in
+        let suffix =
+          match lineNumber with
+          | Just n -> ":" ++ paint p.colors (bold plain) (show n)
+          | None -> ""
+        in
+        ["Source: " ++ paint p.colors (cyan plain) (relativeSource p source) ++ suffix]
+    | None -> []
+  in
+  let inputLine =
+    match m.inputFile with
+    | Just f -> ["Input file: " ++ paint p.colors (cyan plain) f]
+    | None -> []
+  in
+  V.concat [fileLine, [nameLine], sourceLine, inputLine]
+
+fun rule (p : Printer) = S.repeat "─" p.width
+
+fun info (p : Printer) =
+  let (m : MetaData) = p.new.metadata in
+  let expression =
+    match m.expression with
+    | Just e -> ["Expression: " ++ e, rule p]
+    | None -> []
+  in
+  let description =
+    match descriptionOf m with
+    | Just d -> [d, rule p]
+    | None -> []
+  in
+  let extra =
+    match m.info with
+    | Just y -> [trimStart (S.drop (trim (toYaml y)) 3), rule p]
+    | None -> []
+  in
+  V.concat [expression, description, extra]
+
+fun snapshotBody (p : Printer) =
+  let text = contentsText p.new.contents in
+  let lineAt = \k -> V.getOr "" (rustLines text) k in
+  let numbered =
+    V.map
+      (\k -> paint p.colors (bold (dim (cyan plain))) (padLeft 5 (show (k + 1))) ++ " │ " ++ lineAt k)
+      (V.range 0 (V.len (rustLines text)))
+  in
+  V.concat
+    [ [rule p],
+      if p.showInfo then info p else [],
+      ["Snapshot Contents:", "──────┬" ++ S.repeat "─" (sat p.width 7)],
+      numbered,
+      ["──────┴" ++ S.repeat "─" (sat p.width 7)] ]
+
+fun trailingNewline s =
+  if S.endsWith "\r\n" s
+  then "\r\n"
+  else if S.endsWith "\r" s
+  then "\r"
+  else if S.endsWith "\n" s
+  then "\n"
+  else ""
+
+-- Which kinds of line ending `s` has: lone CR, CRLF, lone LF. A CR counts as
+-- lone when it is followed by anything but LF, or ends the text.
+fun detectNewlines s =
+  let cs = stringToChars s in
+  let n = arrayLen cs in
+  let code = \k -> charCode (arrayGet cs k) in
+  let rec go k cr crlf lf =
+    if k >= n
+    then (cr, crlf, lf)
+    else if code k == 13
+    then (if k + 1 < n and code (k + 1) == 10 then go (k + 2) cr True lf else go (k + 1) True crlf lf)
+    else if code k == 10
+    then go (k + 1) cr crlf True
+    else go (k + 1) cr crlf lf
+  in
+  go 0 False False False
+
+-- Whether line endings are part of the difference, and so shown.
+fun newlinesMatter left right =
+  if trailingNewline left != trailingNewline right
+  then True
+  else
+    match (detectNewlines left, detectNewlines right) with
+    | ((cr1, crlf1, lf1), (cr2, crlf2, lf2)) ->
+        let kinds = V.len (V.filter (\b -> b) [cr1 or cr2, crlf1 or crlf2, lf1 or lf2]) in
+        kinds > 1
+
+-- Invisible characters made visible.
+fun renderInvisible s newlines =
+  if newlines or S.contains "\u{1b}" s or S.contains "\u{7}" s or S.contains "\u{8}" s or S.contains "\u{7f}" s
+  then
+    let replace = \from to text -> S.join to (S.split from text) in
+    s
+      |> replace "\r" "␍\r"
+      |> replace "\n" "␊\n"
+      |> replace "␍\r␊\n" "␍␊\r\n"
+      |> replace "\u{7}" "␇"
+      |> replace "\u{8}" "␈"
+      |> replace "\u{1b}" "␛"
+      |> replace "\u{7f}" "␡"
+  else s
+
+fun changeset (p : Printer) =
+  let oldText =
+    match p.old with
+    | Just (o : Snapshot) -> Just (contentsText o.contents)
+    | None -> None
+  in
+  let newText = contentsText p.new.contents in
+  let oldValue =
+    match oldText with
+    | Just t -> t
+    | None -> ""
+  in
+  let matter = newlinesMatter oldValue newText in
+  let d = diffLines { textDiffConfig | algorithm = Patience } oldValue newText in
+  let oldHead = if oldText != None then [paint p.colors (red plain) ("-" ++ p.oldHint)] else [] in
+  let heads = V.pushBack oldHead (paint p.colors (green plain) ("+" ++ p.newHint)) in
+  let number = \style n -> paint p.colors style (padLeft 5 (show (n + 1))) in
+  let blank = S.repeat " " 5 in
+  let lineOf = \(c : InlineChange) ->
+    let values = \colour ->
+      S.join
+        ""
+        (V.map
+          (\v ->
+            match v with
+            | (emphasized, text) ->
+                let shown = renderInvisible text matter in
+                paint p.colors (if emphasized then underlined colour else colour) shown)
+          c.values)
+    in
+    let oldNumber = number (dim (cyan plain)) (orZero c.oldIndex) in
+    let newNumber = number (bold (dim (cyan plain))) (orZero c.newIndex) in
+    let start =
+      match c.tag with
+      | ChangeTag.Insert ->
+          blank ++ " " ++ newNumber ++ " │" ++ paint p.colors (green plain) "+" ++ values (green plain)
+      | ChangeTag.Delete ->
+          oldNumber ++ " " ++ blank ++ " │" ++ paint p.colors (red plain) "-" ++ values (red plain)
+      | ChangeTag.Equal ->
+          oldNumber ++ " " ++ newNumber ++ " │ " ++ values (dim plain)
+    in
+    start ++ (if inlineMissingNewline c then "\n" else "")
+  in
+  let groups = groupedOps d 4 in
+  let groupText = \k ->
+    let separator = if k > 0 then "┈┈┈┈┈┈┈┈┈┈┈┈┼" ++ S.repeat "┈" (sat p.width 13) ++ "\n" else "" in
+    let opText = \op -> S.join "" (V.map lineOf (iterInlineChangesByWords d op)) in
+    separator ++ S.join "" (V.map opText (V.getOr V.empty groups k))
+  in
+  let hasChanges = oldText == None or V.any (\op -> not (isEqualOp op)) d.ops in
+  let body = S.join "" (V.map groupText (V.range 0 (V.len groups))) in
+  let dash = paint p.colors (dim plain) (padLeft 5 "-") in
+  let same = paint p.colors (cyan plain) " snapshots are matching" in
+  let matching = if hasChanges then "" else blank ++ " " ++ dash ++ " │" ++ same ++ "\n" in
+  let bar = S.repeat "─" (sat p.width 13) in
+  let text =
+    S.join "\n" (V.concat [[rule p], if p.showInfo then info p else [], heads, ["────────────┬" ++ bar]])
+      ++ "\n"
+      ++ body
+      ++ matching
+      ++ "────────────┴"
+      ++ S.repeat "─" (sat p.width 13)
+  in
+  S.split "\n" text
+
+fun isEqualOp op =
+  match op with
+  | DiffOp.Equal _ _ _ -> True
+  | _ -> False
+
+fun orZero m =
+  match m with
+  | Just n -> n
+  | None -> 0
+
+-- Everything the printer prints, as lines.
+@pub fun printedLines (p : Printer) =
+  let titleLine =
+    match p.title with
+    | Just t -> [paint p.colors (bold plain) (center p.width "━" " ${t} ")]
+    | None -> []
+  in
+  V.concat [titleLine, summary p, if p.showDiff then changeset p else snapshotBody p]
+
+-- Everything the printer prints, each line ended.
+@pub fun printedText p = S.join "" (V.map (\l -> l ++ "\n") (printedLines p))

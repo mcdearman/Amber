@@ -1,0 +1,814 @@
+-- The YAML insta reads and writes a snapshot's metadata in: values, the
+-- crate's vendored emitter (`src/content/yaml/vendored/emitter.rs`), and a
+-- reader for the block-style YAML found in snapshot headers and `insta.yaml`.
+--
+-- Copyright Armin Ronacher and the insta contributors, Chen Yuheng and the
+-- yaml-rust contributors, and the Meadow port's authors. Licensed under
+-- Apache-2.0: see LICENSE and COPYRIGHT.
+
+use Std.Collections.Vector as V
+use Std.String as S
+
+-- A YAML value. A real number keeps the text it was written with.
+@pub data Yaml =
+  Null
+  | Boolean Bool
+  | Integer Int
+  | Real String
+  | Str String
+  | Seq [Yaml]
+  | Hash [(Yaml, Yaml)]
+  -- What the reader makes of something it cannot read.
+  | BadValue
+
+fun hasBadValue y =
+  match y with
+  | Yaml.BadValue -> True
+  | Yaml.Seq items -> V.any hasBadValue items
+  | Yaml.Hash entries -> V.any (\e -> hasBadValue (fst e) or hasBadValue (snd e)) entries
+  | _ -> False
+
+-- The value under `key` in a mapping.
+@pub fun lookup key y =
+  match y with
+  | Yaml.Hash entries ->
+      (match V.find (\e -> fst e == Yaml.Str key) entries with
+       | Just (_, v) -> Just v
+       | None -> None)
+  | _ -> None
+
+@pub fun asString y =
+  match y with
+  | Yaml.Str s -> Just s
+  | _ -> None
+
+@pub fun asBool y =
+  match y with
+  | Yaml.Boolean b -> Just b
+  | _ -> None
+
+-- A non-negative integer.
+@pub fun asNatural y =
+  match y with
+  | Yaml.Integer n -> if n >= 0 then Just n else None
+  | _ -> None
+
+@pub fun isNull y = y == Yaml.Null
+
+-- --- numbers, as Rust reads them -----------------------------------------------------------
+
+-- The byte at `i` of `s`, as a number.
+fun byteAt s i = toInt (stringByteAt s i)
+
+fun isDigit b = b >= 48 and b <= 57
+
+fun digitsFrom s i = if i < stringByteLength s and isDigit (byteAt s i) then digitsFrom s (i + 1) else i
+
+fun signEnd s i =
+  if i < stringByteLength s and (byteAt s i == 43 or byteAt s i == 45) then i + 1 else i
+
+-- Whether Rust's `str::parse::<i64>` accepts `s`: a sign, then digits, in
+-- range.
+@pub fun parsesAsInt s =
+  let start = signEnd s 0 in
+  let stop = digitsFrom s start in
+  stop == stringByteLength s and stop > start and fitsInt64 s start
+
+fun fitsInt64 s start =
+  let negative = byteAt s 0 == 45 in
+  let rec skipZeros i = if i < stringByteLength s - 1 and byteAt s i == 48 then skipZeros (i + 1) else i in
+  let body = S.drop s (skipZeros start) in
+  let limit = if negative then "9223372036854775808" else "9223372036854775807" in
+  stringByteLength body < 19 or (stringByteLength body == 19 and S.lessOrEqual body limit)
+
+-- Whether Rust's `str::parse::<f64>` accepts `s`.
+@pub fun parsesAsFloat s =
+  let start = signEnd s 0 in
+  let rest = S.toLower (S.drop s start) in
+  if rest == "inf" or rest == "infinity" or rest == "nan"
+  then True
+  else
+    let n = stringByteLength s in
+    let intEnd = digitsFrom s start in
+    let (fracEnd : Int) =
+      if intEnd < n and byteAt s intEnd == 46 then digitsFrom s (intEnd + 1) else intEnd
+    in
+    let mantissaDigits = (intEnd - start) + (if fracEnd > intEnd then fracEnd - intEnd - 1 else 0) in
+    if mantissaDigits == 0
+    then False
+    else if fracEnd == n
+    then True
+    else
+      let e = byteAt s fracEnd in
+      if e != 101 and e != 69
+      then False
+      else
+        let expStart = signEnd s (fracEnd + 1) in
+        let expEnd = digitsFrom s expStart in
+        expEnd == n and expEnd > expStart
+
+-- --- writing -------------------------------------------------------------------------------
+
+fun byteEscape b =
+  if b == 34
+  then Just "\\\""
+  else if b == 92
+  then Just "\\\\"
+  else if b == 8
+  then Just "\\b"
+  else if b == 9
+  then Just "\\t"
+  else if b == 10
+  then Just "\\n"
+  else if b == 12
+  then Just "\\f"
+  else if b == 13
+  then Just "\\r"
+  else if b < 32 or b == 127
+  then Just (if b < 16 then "\\u000${hexDigit b}" else "\\u001${hexDigit (b - 16)}")
+  else None
+
+fun hexDigit n = stringSlice "0123456789abcdef" n (n + 1)
+
+-- `v` in double quotes, escaped as the emitter escapes it.
+fun escapeString v =
+  let n = stringByteLength v in
+  let rec go i from acc =
+    if i >= n
+    then S.join "" (V.pushBack acc (stringSlice v from n))
+    else
+      match byteEscape (byteAt v i) with
+      | Just e -> go (i + 1) (i + 1) (V.pushBack (V.pushBack acc (stringSlice v from i)) e)
+      | None -> go (i + 1) from acc
+  in
+  "\"" ++ go 0 0 V.empty ++ "\""
+
+fun startsWithAny chars s = stringByteLength s > 0 and S.contains (stringSlice s 0 1) chars
+
+fun specialChar c =
+  let cp = charCode c in
+  S.contains (charsToString #[c]) ":{}[],#`\"'\\"
+    or cp <= 6
+    or cp == 9
+    or cp == 10
+    or cp == 13
+    or (cp >= 14 and cp <= 26)
+    or (cp >= 28 and cp <= 31)
+
+def keywords =
+  [ "yes", "Yes", "YES", "no", "No", "NO", "True", "TRUE", "true", "False", "FALSE", "false", "on",
+    "On", "ON", "off", "Off", "OFF", "null", "Null", "NULL", "~" ]
+
+-- Whether the emitter quotes the string `s`.
+@pub fun needsQuotes s =
+  s == ""
+    or S.startsWith " " s
+    or S.endsWith " " s
+    or startsWithAny "&*?|-<>=!%@" s
+    or V.any specialChar (V.fromArray (stringToChars s))
+    or V.elem s keywords
+    or S.startsWith "." s
+    or S.startsWith "0x" s
+    or parsesAsInt s
+    or parsesAsFloat s
+
+fun indent level = if level <= 0 then "" else S.repeat "  " level
+
+fun emitNode lit level node =
+  match node with
+  | Yaml.Seq xs -> emitSeq lit level xs
+  | Yaml.Hash entries -> emitHash lit level entries
+  | Yaml.Str s -> if needsQuotes s then escapeString s else s
+  | Yaml.Boolean b -> if b then "true" else "false"
+  | Yaml.Integer n -> show n
+  | Yaml.Real text -> text
+  | Yaml.Null -> "~"
+  | Yaml.BadValue -> "~"
+
+fun emitSeq lit level xs =
+  if V.isEmpty xs
+  then "[]"
+  else
+    let inner = level + 1 in
+    S.join ("\n" ++ indent inner) (V.map (\x -> "-" ++ emitValue lit True inner x) xs)
+
+fun emitHash lit level entries =
+  if V.isEmpty entries
+  then "{}"
+  else
+    let inner = level + 1 in
+    let entry = \e ->
+      match e with
+      | (k, v) ->
+          match k with
+          | Yaml.Hash _ -> complexEntry lit inner k v
+          | Yaml.Seq _ -> complexEntry lit inner k v
+          | _ -> emitNode lit inner k ++ ":" ++ emitValue lit False inner v
+    in
+    S.join ("\n" ++ indent inner) (V.map entry entries)
+
+fun complexEntry lit level k v =
+  "?" ++ emitValue lit True level k ++ "\n" ++ indent level ++ ":" ++ emitValue lit True level v
+
+fun emitValue lit inline level v =
+  match v with
+  | Yaml.Seq xs ->
+      let lead = if inline or V.isEmpty xs then " " else "\n" ++ indent (level + 1) in
+      lead ++ emitSeq lit level xs
+  | Yaml.Hash entries ->
+      let lead = if inline or V.isEmpty entries then " " else "\n" ++ indent (level + 1) in
+      lead ++ emitHash lit level entries
+  | Yaml.Str text ->
+      if lit and S.contains "\n" text then literalBlock level text else " " ++ emitNode lit level v
+  | _ -> " " ++ emitNode lit level v
+
+-- A string as a literal block, `|`, with the chomping that keeps its
+-- trailing newlines, each line indented one step past `level`.
+fun literalBlock level text =
+  let body = trimTrailingNewlines text in
+  let trailing = stringByteLength text - stringByteLength body in
+  let chomp = if trailing == 0 then " |-\n" else if trailing == 1 then " |\n" else " |+\n" in
+  let pad = S.repeat " " (if (level + 1) * 2 > 2 then (level + 1) * 2 else 2) in
+  let lines = S.join "" (V.map (\line -> pad ++ line ++ "\n") (S.split "\n" body)) in
+  let extra = if trailing > 1 then S.repeat "\n" (trailing - 1) else "" in
+  chomp ++ lines ++ extra
+
+fun trimTrailingNewlines s = if S.endsWith "\n" s then trimTrailingNewlines (S.take s (stringByteLength s - 1)) else s
+
+-- The emitter's text for `doc`, with the newline insta adds; `literal` is
+-- `INSTA_YAML_BLOCK_STYLE=1`, which writes strings of several lines as
+-- literal blocks.
+@pub fun toYamlWith literal doc =
+  let out = "---\n" ++ emitNode literal (0 - 1) doc in
+  if S.endsWith "\n" out then out else out ++ "\n"
+
+@pub fun toYaml doc = toYamlWith False doc
+
+-- --- reading -------------------------------------------------------------------------------
+
+def specialFloats =
+  [".inf", ".Inf", ".INF", "+.inf", "+.Inf", "+.INF", "-.inf", "-.Inf", "-.INF", ".nan", "NaN", ".NAN"]
+
+-- A plain scalar as the loader resolves it.
+@pub fun resolvePlain v =
+  let hex = S.startsWith "0x" v and radixValue 16 (S.drop v 2) != None in
+  let octal = S.startsWith "0o" v and radixValue 8 (S.drop v 2) != None in
+  if hex
+  then Yaml.Integer (orZero (radixValue 16 (S.drop v 2)))
+  else if octal
+  then Yaml.Integer (orZero (radixValue 8 (S.drop v 2)))
+  else if S.startsWith "+" v and parsesAsInt (S.drop v 1) and not (startsWithAny "+-" (S.drop v 1))
+  then Yaml.Integer (decimalValue (S.drop v 1))
+  else if v == "~" or v == "null"
+  then Yaml.Null
+  else if v == "true"
+  then Yaml.Boolean True
+  else if v == "false"
+  then Yaml.Boolean False
+  else if parsesAsInt v
+  then Yaml.Integer (decimalValue v)
+  else if V.elem v specialFloats or parsesAsFloat v
+  then Yaml.Real v
+  else Yaml.Str v
+
+fun orZero m =
+  match m with
+  | Just n -> n
+  | None -> 0
+
+-- `digits` in `radix`, as Rust's `i64::from_str_radix` reads them (a sign
+-- allowed), if they fit.
+fun radixValue radix digits =
+  let negative = S.startsWith "-" digits in
+  let body = if S.startsWith "-" digits or S.startsWith "+" digits then S.drop digits 1 else digits in
+  let value = \b ->
+    if b >= 48 and b <= 57
+    then b - 48
+    else if b >= 97 and b <= 122
+    then b - 87
+    else if b >= 65 and b <= 90
+    then b - 55
+    else 99
+  in
+  let rec go i (acc : BigInt) =
+    if i >= stringByteLength body
+    then Just acc
+    else
+      let d = value (byteAt body i) in
+      if d >= radix then None else go (i + 1) (acc * toBigInt radix + toBigInt d)
+  in
+  if body == ""
+  then None
+  else
+    match go 0 (toBigInt 0) with
+    | Just n ->
+        let signed = if negative then toBigInt 0 - n else n in
+        if signed > toBigInt 9223372036854775807 or signed < toBigInt 0 - toBigInt 9223372036854775807 - toBigInt 1
+        then None
+        else Just (toInt signed)
+    | None -> None
+
+fun decimalValue s = orZero (radixValue 10 s)
+
+-- The document's lines, and where the reader is.
+record Reader = { lines : [String] }
+
+fun lineAt (r : Reader) i = V.getOr "" r.lines i
+
+fun indentOf line =
+  let rec go i = if i < stringByteLength line and byteAt line i == 32 then go (i + 1) else i in
+  go 0
+
+fun contentOf line = S.drop line (indentOf line)
+
+fun isBlank line =
+  let c = S.trim line in
+  c == "" or S.startsWith "#" c
+
+fun skipBlank (r : Reader) i = if i < V.len r.lines and isBlank (lineAt r i) then skipBlank r (i + 1) else i
+
+-- `text` without a comment: `#` after a space, or at the start.
+fun withoutComment text =
+  let n = stringByteLength text in
+  let rec go i =
+    if i >= n
+    then text
+    else if byteAt text i == 35 and (i == 0 or byteAt text (i - 1) == 32 or byteAt text (i - 1) == 9)
+    then S.take text i
+    else go (i + 1)
+  in
+  go 0
+
+fun trimSpaces s = S.trim s
+
+-- Where a mapping key ends in `content`: the colon's byte, if the line is
+-- `key: value` or `key:`.
+fun keyColon content =
+  let n = stringByteLength content in
+  if S.startsWith "\"" content or S.startsWith "'" content
+  then
+    match quotedEnd content 0 with
+    | Just close ->
+        let after = close + 1 in
+        let rec skip i = if i < n and byteAt content i == 32 then skip (i + 1) else i in
+        let at = skip after in
+        if at < n and byteAt content at == 58 and (at + 1 >= n or byteAt content (at + 1) == 32)
+        then Just at
+        else None
+    | None -> None
+  else if S.startsWith "- " content or content == "-" or S.startsWith "#" content
+  then None
+  else
+    let rec go i =
+      if i >= n
+      then None
+      else
+        let b = byteAt content i in
+        if b == 35 and i > 0 and byteAt content (i - 1) == 32
+        then None
+        else if b == 58 and (i + 1 >= n or byteAt content (i + 1) == 32 or byteAt content (i + 1) == 9)
+        then Just i
+        else go (i + 1)
+    in
+    go 0
+
+-- The byte of the quote that closes the quoted scalar starting at `from`, on
+-- this line.
+fun quotedEnd text from =
+  let n = stringByteLength text in
+  let q = byteAt text from in
+  let rec go i =
+    if i >= n
+    then None
+    else
+      let b = byteAt text i in
+      if q == 34 and b == 92
+      then go (i + 2)
+      else if b == q
+      then (if q == 39 and i + 1 < n and byteAt text (i + 1) == 39 then go (i + 2) else Just i)
+      else go (i + 1)
+  in
+  go (from + 1)
+
+fun keyValue text =
+  let t = trimSpaces text in
+  if S.startsWith "\"" t
+  then Yaml.Str (decodeDouble (S.take (S.drop t 1) (stringByteLength t - 2)))
+  else if S.startsWith "'" t
+  then Yaml.Str (decodeSingle (S.take (S.drop t 1) (stringByteLength t - 2)))
+  else resolvePlain t
+
+-- --- scalars ------------------------------------------------------------------------------
+
+fun hexValue text = orZero (radixValue 16 text)
+
+-- The escapes of a double-quoted scalar, its line breaks already folded.
+fun decodeDouble body =
+  let n = stringByteLength body in
+  let rec go i from acc =
+    if i >= n
+    then S.join "" (V.pushBack acc (stringSlice body from n))
+    else if byteAt body i != 92
+    then go (i + 1) from acc
+    else
+      let before = V.pushBack acc (stringSlice body from i) in
+      let c = if i + 1 < n then stringSlice body (i + 1) (i + 2) else "" in
+      let simple = \out -> go (i + 2) (i + 2) (V.pushBack before out) in
+      let code = \len -> charsToString #[charFromCode (hexValue (stringSlice body (i + 2) (i + 2 + len)))] in
+      let coded = \len -> go (i + 2 + len) (i + 2 + len) (V.pushBack before (code len)) in
+      if c == "0"
+      then simple "\u{0}"
+      else if c == "a"
+      then simple "\u{7}"
+      else if c == "b"
+      then simple "\u{8}"
+      else if c == "t" or c == "\t"
+      then simple "\t"
+      else if c == "n"
+      then simple "\n"
+      else if c == "v"
+      then simple "\u{b}"
+      else if c == "f"
+      then simple "\u{c}"
+      else if c == "r"
+      then simple "\r"
+      else if c == "e"
+      then simple "\u{1b}"
+      else if c == " "
+      then simple " "
+      else if c == "\""
+      then simple "\""
+      else if c == "/"
+      then simple "/"
+      else if c == "\\"
+      then simple "\\"
+      else if c == "N"
+      then simple "\u{85}"
+      else if c == "_"
+      then simple "\u{a0}"
+      else if c == "L"
+      then simple "\u{2028}"
+      else if c == "P"
+      then simple "\u{2029}"
+      else if c == "x"
+      then coded 2
+      else if c == "u"
+      then coded 4
+      else if c == "U"
+      then coded 8
+      else simple c
+  in
+  go 0 0 V.empty
+
+fun decodeSingle body = S.join "'" (S.split "''" body)
+
+-- The lines of a flow scalar folded into one: a single break is a space,
+-- each empty line a newline, and a `\` before a break (in double quotes)
+-- joins the lines.
+fun foldLines double lines =
+  let count = V.len lines in
+  let trimmedLine = \k ->
+    let line = V.getOr "" lines k in
+    let left = if k == 0 then line else S.trimStart line in
+    if k == count - 1 then left else S.trimEnd left
+  in
+  let rec go k acc pendingBreaks =
+    if k >= count
+    then acc
+    else
+      let line = trimmedLine k in
+      if k > 0 and line == "" and k < count - 1
+      then go (k + 1) acc (pendingBreaks + 1)
+      else
+        let joined =
+          if k == 0
+          then line
+          else if double and S.endsWith "\\" acc and not (S.endsWith "\\\\" acc)
+          then S.take acc (stringByteLength acc - 1) ++ line
+          else if pendingBreaks > 0
+          then acc ++ S.repeat "\n" pendingBreaks ++ line
+          else acc ++ " " ++ line
+        in
+        go (k + 1) joined 0
+  in
+  go 0 "" 0
+
+-- A quoted scalar starting at byte `at` of line `i`: its value, what follows
+-- it on its last line, and the line after that.
+fun readQuoted (r : Reader) i at =
+  let first = lineAt r i in
+  let quote = stringSlice first at (at + 1) in
+  let double = quote == "\"" in
+  match quotedEnd first at with
+  | Just close ->
+      let body = stringSlice first (at + 1) close in
+      let value = if double then decodeDouble body else decodeSingle body in
+      (value, S.drop first (close + 1), i + 1)
+  | None ->
+      let rec gather k acc =
+        if k >= V.len r.lines
+        then (acc, k, "")
+        else
+          let line = lineAt r k in
+          let probe = "\"" ++ line in
+          let probeSingle = "'" ++ line in
+          match quotedEnd (if double then probe else probeSingle) 0 with
+          | Just close -> (V.pushBack acc (S.take line (close - 1)), k, S.drop line close)
+          | None -> gather (k + 1) (V.pushBack acc line)
+      in
+      match gather (i + 1) [S.drop first (at + 1)] with
+      | (parts, last, rest) ->
+          let folded = foldLines double parts in
+          let value = if double then decodeDouble folded else decodeSingle folded in
+          (value, rest, last + 1)
+
+-- A plain scalar that starts with `text` on line `i` and may go on over lines
+-- indented past `parent`.
+fun readPlain (r : Reader) i parent text =
+  let rec more k acc =
+    if k >= V.len r.lines
+    then (acc, k)
+    else
+      let line = lineAt r k in
+      if S.trim line == ""
+      then more (k + 1) (V.pushBack acc "")
+      else if indentOf line > parent and not (S.startsWith "#" (contentOf line)) and keyColon (contentOf line) == None
+      then more (k + 1) (V.pushBack acc (withoutComment (contentOf line)))
+      else (acc, k)
+  in
+  match more (i + 1) [withoutComment text] with
+  | (parts, next) ->
+      let trailingBlanks = V.len (V.takeWhile (\p -> p == "") (V.reverse parts)) in
+      let kept = V.take parts (V.len parts - trailingBlanks) in
+      (resolvePlain (S.trim (foldLines False kept)), next - trailingBlanks)
+
+-- A block scalar whose header is `header`, on line `i`, inside `parent`.
+fun readBlock (r : Reader) i parent header =
+  let folded = S.startsWith ">" header in
+  let chomp = if S.contains "-" header then 0 - 1 else if S.contains "+" header then 1 else 0 in
+  let explicit = V.find (\d -> S.contains (show d) header) (V.range 1 10) in
+  let rec collect k acc =
+    if k >= V.len r.lines
+    then (acc, k)
+    else
+      let line = lineAt r k in
+      if S.trim line == "" or indentOf line > parent
+      then collect (k + 1) (V.pushBack acc line)
+      else (acc, k)
+  in
+  match collect (i + 1) V.empty with
+  | (raw, next) ->
+      let firstText = V.find (\l -> S.trim l != "") raw in
+      let blockIndent =
+        match explicit with
+        | Just d -> parent + d
+        | None ->
+            match firstText with
+            | Just l -> indentOf l
+            | None -> parent + 1
+      in
+      let unindent = \l ->
+        if stringByteLength l <= blockIndent and indentOf l >= stringByteLength l then "" else S.drop l blockIndent
+      in
+      let content = V.map unindent raw in
+      let trailingEmpty = V.len (V.takeWhile (\l -> l == "") (V.reverse content)) in
+      let body = V.take content (V.len content - trailingEmpty) in
+      let text =
+        if folded
+        then foldBlock body
+        else S.join "\n" body
+      in
+      let ending =
+        if V.isEmpty body
+        then (if chomp == 1 then S.repeat "\n" trailingEmpty else "")
+        else if chomp == 0 - 1
+        then ""
+        else if chomp == 0
+        then "\n"
+        else S.repeat "\n" (trailingEmpty + 1)
+      in
+      (Yaml.Str (text ++ ending), next - (if chomp == 1 then 0 else 0))
+
+-- A folded block's lines: a break between two lines of text is a space, an
+-- empty line is a newline, and lines more indented keep their breaks.
+fun foldBlock lines =
+  let rec go k acc previousPlain started pending =
+    match V.get lines k with
+    | None -> acc ++ S.repeat "\n" (if started then 0 else pending)
+    | Just line ->
+        if line == ""
+        then go (k + 1) acc previousPlain started (pending + 1)
+        else
+          let plain = not (S.startsWith " " line) and not (S.startsWith "\t" line) in
+          let sep =
+            if not started
+            then S.repeat "\n" pending
+            else if pending > 0
+            then S.repeat "\n" (if previousPlain and plain then pending else pending + 1)
+            else if previousPlain and plain
+            then " "
+            else "\n"
+          in
+          go (k + 1) (acc ++ sep ++ line) plain True 0
+  in
+  go 0 "" False False 0
+
+-- --- flow collections ---------------------------------------------------------------------
+
+-- A flow collection or scalar at byte `at` of `text`: its value and the byte
+-- after it.
+fun flowNode text at =
+  let n = stringByteLength text in
+  let rec skip i = if i < n and (byteAt text i == 32 or byteAt text i == 10) then skip (i + 1) else i in
+  let start = skip at in
+  let c = if start < n then stringSlice text start (start + 1) else "" in
+  if c == "["
+  then flowItems text (start + 1) "]" False
+  else if c == "{"
+  then flowItems text (start + 1) "}" True
+  else if c == "\"" or c == "'"
+  then
+    match quotedEnd text start with
+    | Just close ->
+        let body = stringSlice text (start + 1) close in
+        (Yaml.Str (if c == "\"" then decodeDouble body else decodeSingle body), close + 1)
+    | None -> (Yaml.Str (S.drop text start), n)
+  else
+    let rec plainEnd i =
+      if i >= n
+      then i
+      else
+        let b = stringSlice text i (i + 1) in
+        if b == "," or b == "]" or b == "}" or (b == ":" and (i + 1 >= n or stringSlice text (i + 1) (i + 2) == " "))
+        then i
+        else plainEnd (i + 1)
+    in
+    let stop = plainEnd start in
+    (resolvePlain (S.trim (stringSlice text start stop)), stop)
+
+fun flowItems text at close pairs =
+  let n = stringByteLength text in
+  let separator = \i -> byteAt text i == 32 or byteAt text i == 10 or byteAt text i == 44 in
+  let rec skip i = if i < n and separator i then skip (i + 1) else i in
+  let rec go i items =
+    let j = skip i in
+    if j >= n
+    then (finish pairs items, n)
+    else if stringSlice text j (j + 1) == close
+    then (finish pairs items, j + 1)
+    else
+      match flowNode text j with
+      | (key, afterKey) ->
+          let k = skip0 text afterKey in
+          if k < n and stringSlice text k (k + 1) == ":"
+          then
+            (match flowNode text (k + 1) with
+             | (value, afterValue) -> go afterValue (V.pushBack items (key, Just value)))
+          else go afterKey (V.pushBack items (key, None))
+  in
+  go at V.empty
+
+fun skip0 text i = if i < stringByteLength text and byteAt text i == 32 then skip0 text (i + 1) else i
+
+fun finish pairs items =
+  if pairs
+  then
+    Yaml.Hash
+      (V.map
+        (\p ->
+          match p with
+          | (k, Just v) -> (k, v)
+          | (k, None) -> (k, Yaml.Null))
+        items)
+  else
+    let single = \p ->
+      match p with
+      | (k, Just v) -> Yaml.Hash [(k, v)]
+      | (k, None) -> k
+    in
+    Yaml.Seq (V.map single items)
+
+-- A flow collection starting at byte `at` of line `i`, perhaps over several
+-- lines: its value and the next line.
+fun readFlow (r : Reader) i at =
+  let open = \s -> V.len (V.filter (\c -> c == '[' or c == '{') (V.fromArray (stringToChars s))) in
+  let shut = \s -> V.len (V.filter (\c -> c == ']' or c == '}') (V.fromArray (stringToChars s))) in
+  let rec gather k text =
+    if open text <= shut text or k >= V.len r.lines then (text, k) else gather (k + 1) (text ++ "\n" ++ lineAt r k)
+  in
+  match gather (i + 1) (S.drop (lineAt r i) at) with
+  | (text, next) ->
+      let bare = withoutComment text in
+      if open bare > shut bare then (Yaml.BadValue, next) else (fst (flowNode text 0), next)
+
+-- --- block collections --------------------------------------------------------------------
+
+-- The value that starts with `text` at column `column` of line `i`, in a
+-- collection at indent `parent`.
+fun readInline (r : Reader) i column parent text =
+  let t = withoutComment text in
+  let trimmed = S.trim t in
+  if S.startsWith "\"" trimmed or S.startsWith "'" trimmed
+  then
+    match readQuoted r i (column + (stringByteLength t - stringByteLength (S.trimStart t))) with
+    | (value, _, next) -> (Yaml.Str value, next)
+  else if S.startsWith "[" trimmed or S.startsWith "{" trimmed
+  then readFlow r i (column + (stringByteLength t - stringByteLength (S.trimStart t)))
+  else if S.startsWith "|" trimmed or S.startsWith ">" trimmed
+  then readBlock r i parent trimmed
+  else readPlain r i parent trimmed
+
+-- The node at line `i` or later, indented at least `least`.
+fun readNode (r : Reader) i least =
+  let j = skipBlank r i in
+  if j >= V.len r.lines or isEnd (lineAt r j)
+  then (Yaml.Null, j)
+  else
+    let line = lineAt r j in
+    let column = indentOf line in
+    if column < least
+    then (Yaml.Null, j)
+    else
+      let content = contentOf line in
+      if S.startsWith "- " content or content == "-"
+      then readSeq r j column
+      else if keyColon content != None
+      then readMap r j column
+      else readInline r j column (column - 1) content
+
+fun isEnd line = line == "---" or S.startsWith "--- " line or line == "..."
+
+-- `r` with line `i` replaced by `text` at column `column`: how an entry that
+-- starts on the same line as its `-` is read.
+fun shifted (r : Reader) i column text = Reader { lines = V.set r.lines i (S.repeat " " column ++ text) }
+
+fun readSeq (r : Reader) i column =
+  let rec go k items (rr : Reader) =
+    let j = skipBlank rr k in
+    let line = lineAt rr j in
+    let content = contentOf line in
+    if j >= V.len rr.lines or isEnd line or indentOf line != column or not (S.startsWith "- " content or content == "-")
+    then (Yaml.Seq items, j, rr)
+    else
+      let rest = S.drop content 1 in
+      let restText = S.trimStart rest in
+      if S.trim (withoutComment restText) == ""
+      then
+        (match readNode rr (j + 1) (column + 1) with
+         | (item, next) -> go next (V.pushBack items item) rr)
+      else
+        let itemColumn = column + 1 + (stringByteLength rest - stringByteLength restText) in
+        let r2 = shifted rr j itemColumn restText in
+        match readNode r2 j itemColumn with
+        | (item, next) -> go next (V.pushBack items item) r2
+  in
+  match go i V.empty r with
+  | (value, next, _) -> (value, next)
+
+fun readMap (r : Reader) i column =
+  let rec go k entries =
+    let j = skipBlank r k in
+    let line = lineAt r j in
+    let content = contentOf line in
+    if j >= V.len r.lines or isEnd line or indentOf line != column
+    then (Yaml.Hash entries, j)
+    else
+      match keyColon content with
+      | None -> (Yaml.Hash entries, j)
+      | Just colon ->
+          let key = keyValue (S.take content colon) in
+          let rest = S.drop content (colon + 1) in
+          if S.trim (withoutComment rest) == ""
+          then
+            let n = skipBlank r (j + 1) in
+            let nextLine = lineAt r n in
+            let dash = S.startsWith "- " (contentOf nextLine) or contentOf nextLine == "-" in
+            let sameIndentSeq = n < V.len r.lines and indentOf nextLine == column and dash in
+            if sameIndentSeq
+            then
+              (match readSeq r n column with
+               | (value, next) -> go next (V.pushBack entries (key, value)))
+            else
+              (match readNode r (j + 1) (column + 1) with
+               | (value, next) -> go next (V.pushBack entries (key, value)))
+          else
+            match readInline r j (column + colon + 1) column rest with
+            | (value, next) -> go next (V.pushBack entries (key, value))
+  in
+  go i V.empty
+
+-- The one document in `text`, or `None` if there is not exactly one.
+@pub fun parseYaml text =
+  let lines = V.map (\l -> if S.endsWith "\r" l then S.take l (stringByteLength l - 1) else l) (S.split "\n" text) in
+  let r = Reader { lines = lines } in
+  let start = skipBlank r 0 in
+  let first = lineAt r start in
+  let (bodyStart : Int) = if first == "---" then start + 1 else start in
+  let r2 = if S.startsWith "--- " first then shifted r start 0 (S.drop first 4) else r in
+  match readNode r2 bodyStart 0 with
+  | (value, _) if hasBadValue value -> None
+  | (value, next) ->
+      let after = skipBlank r2 next in
+      if after >= V.len r2.lines or lineAt r2 after == "..."
+      then Just value
+      else None

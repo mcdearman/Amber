@@ -1,0 +1,397 @@
+-- Snapshots: their contents and how those are compared, their metadata, and
+-- the `.snap` file they live in. The crate's `src/snapshot.rs`.
+--
+-- Copyright Armin Ronacher and the insta contributors, and the Meadow port's
+-- authors. Licensed under Apache-2.0: see LICENSE and COPYRIGHT.
+
+use Std.Collections.Vector as V
+use Std.String as S
+use insta.Yaml
+
+-- --- contents ------------------------------------------------------------------------------
+
+-- Where a snapshot's text came from: a `.snap` file, or a literal in the test.
+@pub data TextKind = Inline | File
+
+-- A snapshot's text as written, and where it came from.
+@pub record Contents = { text : String, kind : TextKind }
+
+@pub fun contents text kind = Contents { text = text, kind = kind }
+
+-- Rust's `str::lines`: split at `\n`, a `\r` before one dropped, and no empty
+-- line after a final newline.
+@pub fun rustLines s =
+  if s == ""
+  then V.empty
+  else
+    let parts = S.split "\n" s in
+    let kept = if S.endsWith "\n" s then V.take parts (V.len parts - 1) else parts in
+    V.map (\l -> if S.endsWith "\r" l then S.take l (stringByteLength l - 1) else l) kept
+
+fun isRustWhitespace c =
+  let cp = charCode c in
+  (cp >= 9 and cp <= 13)
+    or cp == 32
+    or cp == 0x85
+    or cp == 0xA0
+    or cp == 0x1680
+    or (cp >= 0x2000 and cp <= 0x200A)
+    or cp == 0x2028
+    or cp == 0x2029
+    or cp == 0x202F
+    or cp == 0x205F
+    or cp == 0x3000
+
+-- Rust's `trim_end`, `trim_start` and `trim`, on Unicode whitespace.
+@pub fun trimEnd s =
+  let cs = stringToChars s in
+  let rec go n = if n > 0 and isRustWhitespace (arrayGet cs (n - 1)) then go (n - 1) else n in
+  charsToString (arraySlice cs 0 (go (arrayLen cs)))
+
+@pub fun trimStart s =
+  let cs = stringToChars s in
+  let rec go n = if n < arrayLen cs and isRustWhitespace (arrayGet cs n) then go (n + 1) else n in
+  charsToString (arraySlice cs (go 0) (arrayLen cs))
+
+@pub fun trim s = trimStart (trimEnd s)
+
+-- Horizontal whitespace at the start of `line`.
+fun leadingSpace line =
+  let n = stringByteLength line in
+  let blank = \i -> let b = toInt (stringByteAt line i) in b == 32 or b == 9 in
+  let rec go i = if i < n and blank i then go (i + 1) else i in
+  S.take line (go 0)
+
+-- The least indentation of the non-empty lines, the first found of the
+-- shortest.
+@pub fun minIndentation snapshot =
+  let spaces = V.map leadingSpace (V.filter (\l -> l != "") (rustLines (trimEnd snapshot))) in
+  V.foldl
+    (\best s ->
+      match best with
+      | Just b -> if stringByteLength s < stringByteLength b then Just s else best
+      | None -> Just s)
+    None
+    spaces
+    |> (\m ->
+      match m with
+      | Just s -> s
+      | None -> "")
+
+fun countLines s = V.len (rustLines s)
+
+-- An inline snapshot's text with its common indentation taken off.
+@pub fun normalizeInline snapshot =
+  if countLines (trimEnd snapshot) <= 1
+  then trimEnd snapshot
+  else
+    let cut = stringByteLength (minIndentation snapshot) in
+    S.join "\n" (V.map (\l -> if stringByteLength l >= cut then S.drop l cut else "") (rustLines snapshot))
+
+-- The text a snapshot is compared by: an inline one's indentation removed,
+-- trailing whitespace dropped, and CRLF as LF.
+@pub fun normalize (c : Contents) =
+  let base =
+    match c.kind with
+    | TextKind.Inline -> normalizeInline c.text
+    | TextKind.File -> c.text
+  in
+  S.join "\n" (S.split "\r\n" (trimEnd base))
+
+-- The snapshot as insta shows it: normalized.
+@pub fun contentsText c = normalize c
+
+@pub fun matchesFully (a : Contents) (b : Contents) = a.text == b.text
+
+@pub fun matchesLatest a b = normalize a == normalize b
+
+-- A value written the way old versions of insta wrote inline snapshots:
+-- each line after a `⋮`.
+@pub fun legacyInlineNormalize frozen =
+  if not (S.startsWith "⋮" (trimStart frozen))
+  then frozen
+  else
+    let lines = rustLines frozen in
+    let firstAt = V.find (\k -> trimStart (V.getOr "" lines k) != "") (V.range 0 (V.len lines)) in
+    match firstAt with
+    | None -> ""
+    | Just k ->
+        let first = V.getOr "" lines k in
+        let firstTrimmed = trimStart first in
+        let indentation = stringByteLength first - stringByteLength firstTrimmed in
+        let start = S.drop firstTrimmed 3 ++ "\n" in
+        let rec go j acc =
+          match V.get lines j with
+          | None -> Just acc
+          | Just line ->
+              let prefixBad = stringByteLength line >= indentation and trim (S.take line indentation) != "" in
+              if prefixBad
+              then None
+              else if stringByteLength line >= indentation
+              then
+                let remainder = S.drop line indentation in
+                if S.startsWith "⋮" remainder
+                then go (j + 1) (acc ++ S.drop remainder 3 ++ "\n")
+                else if trim remainder == ""
+                then go (j + 1) acc
+                else None
+              else go (j + 1) acc
+        in
+        match go (k + 1) start with
+        | Just text -> trimEnd text
+        | None -> ""
+
+@pub fun matchesLegacy (a : Contents) (b : Contents) =
+  let legacy = \(c : Contents) ->
+    let out = normalize c in
+    let trimmedNewlines = trimLeadingNewlines out in
+    let body = if S.startsWith "---\n" trimmedNewlines then S.drop trimmedNewlines 4 else trimmedNewlines in
+    match c.kind with
+    | TextKind.Inline ->
+        let normalized = legacyInlineNormalize body in
+        let singleInMulti = S.contains "\n" c.text and countLines (trimEnd c.text) <= 1 in
+        if singleInMulti then trimStart normalized else normalized
+    | TextKind.File -> body
+  in
+  legacy a == legacy b
+
+fun trimLeadingNewlines s = if S.startsWith "\n" s or S.startsWith "\r" s then trimLeadingNewlines (S.drop s 1) else s
+
+-- Whether a snapshot matches: now, or by the rules old snapshots were
+-- written by.
+@pub fun matches a b = matchesLatest a b or matchesLegacy a b
+
+fun isControl c =
+  let cp = charCode c in
+  cp < 32 or (cp >= 127 and cp < 160)
+
+-- Whether the text has control characters an inline literal must escape.
+@pub fun needsEscapedFormat text =
+  let escaped = \c -> isControl c and charCode c != 10 and charCode c != 9 and charCode c != 27 in
+  V.any escaped (V.fromArray (stringToChars text))
+
+-- An inline snapshot's text as the literal in the test holds it: one line as
+-- it is, and several with the first, empty, line dropped.
+@pub fun fromInlineLiteral literal =
+  if countLines (trimEnd literal) <= 1 or needsEscapedFormat literal
+  then contents (trimEnd literal) TextKind.Inline
+  else
+    let lines = rustLines literal in
+    let first = V.getOr "" lines 0 in
+    let text = if first != "" then S.join "\n" lines else S.join "\n" (V.drop lines 1) in
+    contents text TextKind.Inline
+
+-- How many `#`s a Rust raw string of `text` needs.
+@pub fun requiredHashes text =
+  let parts = V.drop (S.split "\"" text) 1 in
+  let hashes = \p ->
+    let n = stringByteLength p in
+    let rec go i = if i < n and toInt (stringByteAt p i) == 35 then go (i + 1) else i in
+    go 0 + 1
+  in
+  V.foldl (\best p -> let h = hashes p in if h > best then h else best) 0 parts
+
+-- The text as the Rust literal insta writes into a test, indented by
+-- `indentation`.
+@pub fun toInline indentation c =
+  let text = normalize c in
+  let escaped = needsEscapedFormat text in
+  let raw = not escaped and (S.contains "\\" text or S.contains "\"" text) in
+  let delimiter = S.repeat "#" (requiredHashes text) in
+  let body =
+    if escaped
+    then rustDebug text
+    else if S.contains "\n" text
+    then
+      let line = \l -> "\n" ++ (if l == "" then "" else indentation) ++ l in
+      "\"" ++ S.join "" (V.map line (rustLines text)) ++ "\n" ++ indentation ++ "\""
+    else "\"" ++ text ++ "\""
+  in
+  (if raw then "r" else "") ++ delimiter ++ body ++ delimiter
+
+fun hex n =
+  let digits = "0123456789abcdef" in
+  let rec go m acc = if m == 0 then acc else go (m / 16) (stringSlice digits (m % 16) (m % 16 + 1) ++ acc) in
+  if n == 0 then "0" else go n ""
+
+-- `text` as Rust's `{:?}` writes a string, for the characters an escaped
+-- inline snapshot can hold.
+fun rustDebug text =
+  let escape = \c ->
+    let cp = charCode c in
+    if cp == 0
+    then "\\0"
+    else if cp == 9
+    then "\\t"
+    else if cp == 10
+    then "\\n"
+    else if cp == 13
+    then "\\r"
+    else if cp == 34
+    then "\\\""
+    else if cp == 92
+    then "\\\\"
+    else if isControl c
+    then "\\u{${hex cp}}"
+    else charsToString #[c]
+  in
+  "\"" ++ S.join "" (V.map escape (V.fromArray (stringToChars text))) ++ "\""
+
+-- --- metadata ------------------------------------------------------------------------------
+
+-- What a snapshot records about where it came from.
+@pub record MetaData = {
+  source : Maybe String,
+  assertionLine : Maybe Int,
+  description : Maybe String,
+  expression : Maybe String,
+  info : Maybe Yaml,
+  inputFile : Maybe String
+}
+
+@pub def noMetadata =
+  MetaData { source = None, assertionLine = None, description = None, expression = None, info = None, inputFile = None }
+
+-- The description, if it is not empty.
+@pub fun descriptionOf (m : MetaData) =
+  match m.description with
+  | Just "" -> None
+  | other -> other
+
+fun field name m =
+  match m with
+  | Just v -> [(Yaml.Str name, v)]
+  | None -> []
+
+-- The metadata as the YAML header writes it.
+@pub fun metadataYaml (m : MetaData) =
+  Yaml.Hash
+    (V.concat
+      [ field "source" (maybeMap Yaml.Str m.source),
+        field "assertion_line" (maybeMap Yaml.Integer m.assertionLine),
+        field "description" (maybeMap Yaml.Str m.description),
+        field "expression" (maybeMap Yaml.Str m.expression),
+        field "info" m.info,
+        field "input_file" (maybeMap Yaml.Str m.inputFile) ])
+
+fun maybeMap f m =
+  match m with
+  | Just x -> Just (f x)
+  | None -> None
+
+-- The metadata in a header's YAML, the last of each key counting, as the
+-- crate reads it.
+@pub fun metadataFromYaml y =
+  match y with
+  | Yaml.Hash entries ->
+      let step = \(m : MetaData) e ->
+        match e with
+        | (Yaml.Str "source", v) -> { m | source = asString v }
+        | (Yaml.Str "assertion_line", v) -> { m | assertionLine = maybeMap (\n -> n % 4294967296) (asNatural v) }
+        | (Yaml.Str "description", v) -> { m | description = asString v }
+        | (Yaml.Str "expression", v) -> { m | expression = asString v }
+        | (Yaml.Str "info", v) -> if isNull v then m else { m | info = Just v }
+        | (Yaml.Str "input_file", v) -> { m | inputFile = asString v }
+        | _ -> m
+      in
+      Ok (V.foldl step noMetadata entries)
+  | _ -> Err "The present data type wasn't what was expected"
+
+-- The metadata as saved to the `.snap` file: without the assertion's line.
+@pub fun forPersistence (m : MetaData) = { m | assertionLine = None }
+
+-- --- snapshots -----------------------------------------------------------------------------
+
+@pub record Snapshot = { moduleName : String, snapshotName : Maybe String, metadata : MetaData, contents : Contents }
+
+-- The file's text: the metadata, `---`, and the contents. `literal` is
+-- `INSTA_YAML_BLOCK_STYLE=1`.
+@pub fun serialize literal (s : Snapshot) (m : MetaData) =
+  toYamlWith literal (metadataYaml m) ++ "---\n" ++ contentsText s.contents ++ "\n"
+
+-- A snapshot file's name, as test name and module name: the parts of the
+-- file stem either side of its last `__`.
+@pub fun namesOfPath path =
+  let base = V.getOr "" (V.reverse (S.split "/" path)) 0 in
+  let stem =
+    match V.find (\k -> stringSlice base k (k + 1) == ".") (V.reverse (V.range 1 (stringByteLength base))) with
+    | Just dot -> S.take base dot
+    | None -> base
+  in
+  match lastIndexOf "__" stem with
+  | Just at -> (S.drop stem (at + 2), S.take stem at)
+  | None -> (stem, "")
+
+fun lastIndexOf needle s =
+  let rec go from found =
+    match S.indexOfFrom needle s from with
+    | Just at -> go (at + 1) (Just at)
+    | None -> found
+  in
+  go 0 None
+
+-- Whether a `.snap` file's text has the legacy header, which insta warns
+-- about.
+@pub fun isLegacySnapshot text = trimEnd (V.getOr "" (S.split "\n" text) 0) != "---"
+
+-- Reads a `.snap` file's text: a YAML header between `---` lines, or the
+-- legacy `key: value` header ending at an empty line; then the contents.
+@pub fun parseSnapshot path text =
+  let lines = S.split "\n" text in
+  let first = V.getOr "" lines 0 in
+  let (names : (String, String)) = namesOfPath path in
+  let body = \rest -> S.join "\n" (rustLines (S.join "\n" rest)) in
+  let snapshot = \m rest ->
+    Snapshot {
+      moduleName = snd names,
+      snapshotName = Just (fst names),
+      metadata = m,
+      contents = contents (body rest) TextKind.File
+    }
+  in
+  if trimEnd first == "---"
+  then
+    let closing = V.find (\k -> trimEnd (V.getOr "" lines k) == "---") (V.range 1 (V.len lines)) in
+    let headerEnd =
+      match closing with
+      | Just k -> k
+      | None -> V.len lines
+    in
+    let header = S.join "\n" (V.take lines headerEnd) in
+    let header2 = if closing == None then header else header ++ "\n" in
+    let rest = if closing == None then V.empty else V.drop lines (headerEnd + 1) in
+    match parseYaml header2 with
+    | Just y ->
+        (match metadataFromYaml y with
+         | Ok m -> Ok (snapshot m rest)
+         | Err e -> Err e)
+    | None -> Err "Failed parsing the YAML from \"${path}\""
+  else
+    let headerEnd =
+      match V.find (\k -> trimEnd (V.getOr "" lines k) == "") (V.range 1 (V.len lines)) with
+      | Just k -> k
+      | None -> V.len lines
+    in
+    let read = \(m : MetaData) line ->
+      match S.indexOf ":" line with
+      | Just at ->
+          let value = trim (S.drop line (at + 1)) in
+          let key = S.toLower (S.take line at) in
+          if key == "expression"
+          then { m | expression = Just value }
+          else if key == "source"
+          then { m | source = Just value }
+          else m
+      | None -> m
+    in
+    let m = V.foldl read noMetadata (V.slice lines 1 headerEnd) in
+    Ok (snapshot m (V.drop lines (headerEnd + 1)))
+
+-- Whether `test` matches `reference` exactly, as `INSTA_REQUIRE_FULL_MATCH`
+-- asks: the same text, and for a file snapshot the same metadata too, but for
+-- the assertion's line.
+@pub fun snapshotsMatchFully (reference : Snapshot) (test : Snapshot) =
+  let same = matchesLatest reference.contents test.contents in
+  match reference.contents.kind with
+  | TextKind.File -> same and forPersistence reference.metadata == forPersistence test.metadata
+  | TextKind.Inline -> same

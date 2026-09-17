@@ -1,0 +1,28 @@
+-- insta: snapshot testing. A test asserts that a value matches the snapshot
+-- stored for it, and a changed value is stored as a new snapshot to review.
+-- A port of Rust's `insta` crate, version 1.48.0: its `.snap` files, its
+-- `INSTA_*` settings and its diffs.
+--
+--   use insta (assertSnapshot)
+--
+--   @test fun rendersTheReport () = assertSnapshot "report" (render report)
+--
+-- The first run stores `snapshots/report.snap.new`; accept it by renaming it
+-- to `report.snap` (or `acceptPending "snapshots"`), or run the tests with
+-- `INSTA_UPDATE=always`.
+
+mod Yaml
+mod Snapshot
+mod Output
+mod Runtime
+@cfg(test)
+mod Cases
+@cfg(test)
+mod Tests
+
+@pub use insta.Yaml
+@pub use insta.Yaml.Yaml.*
+@pub use insta.Snapshot
+@pub use insta.Snapshot.TextKind.*
+@pub use insta.Output
+@pub use insta.Runtime

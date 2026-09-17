@@ -1,0 +1,509 @@
+-- Asserting a snapshot: find the old one, compare, report, and store the new
+-- one as the environment says. The crate's `src/runtime.rs` and `src/env.rs`.
+--
+-- Rust gives insta the test's name, file and line; Meadow does not, so a
+-- snapshot is named by the caller and placed by `Settings`.
+--
+-- Copyright Armin Ronacher and the insta contributors, and the Meadow port's
+-- authors. Licensed under Apache-2.0: see LICENSE and COPYRIGHT.
+
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Fs (readToString, writeString, createDirAll, removeFile, exists, readDir, rename)
+use Std.Console (writeOutput)
+use Std.Test (fail)
+use insta.Yaml
+use insta.Snapshot
+use insta.Output
+
+-- --- configuration -------------------------------------------------------------------------
+
+-- `INSTA_UPDATE`: when to write a changed snapshot.
+@pub data SnapshotUpdate = Always | Auto | Unseen | New | No | Force
+
+-- `INSTA_OUTPUT`: how much to print about a failure.
+@pub data OutputBehavior = Diff | Summary | Minimal | Nothing
+
+-- The run's settings, from the environment and the workspace's `insta.yaml`.
+@pub record ToolConfig = {
+  forcePass : Bool,
+  requireFullMatch : Bool,
+  output : OutputBehavior,
+  update : SnapshotUpdate
+}
+
+fun resolve path y =
+  V.foldl
+    (\acc key ->
+      match acc with
+      | Just node -> lookup key node
+      | None -> None)
+    (Just y)
+    path
+
+fun envFlag name config path =
+  match getEnv name with
+  | None -> Ok (maybeBool (resolve path config))
+  | Just "" -> Ok (maybeBool (resolve path config))
+  | Just "0" -> Ok False
+  | Just "1" -> Ok True
+  | Just _ -> Err "invalid value for env var '${name}'"
+
+fun maybeBool m =
+  match m with
+  | Just y ->
+      (match asBool y with
+       | Just b -> b
+       | None -> False)
+  | None -> False
+
+fun envText name config path fallback =
+  let fromConfig =
+    match resolve path config with
+    | Just y ->
+        (match asString y with
+         | Just s -> s
+         | None -> fallback)
+    | None -> fallback
+  in
+  match getEnv name with
+  | None -> fromConfig
+  | Just "" -> fromConfig
+  | Just v -> v
+
+-- The configuration for `workspace`: `.config/insta.yaml`, `insta.yaml` or
+-- `.insta.yaml`, whichever comes first, with the environment over it.
+@pub fun toolConfig workspace =
+  let candidates = [".config/insta.yaml", "insta.yaml", ".insta.yaml"] in
+  let found = V.find (\f -> exists (joinPath workspace f)) candidates in
+  let config =
+    match found with
+    | Just f ->
+        (match readToString (joinPath workspace f) with
+         | Ok text ->
+             (match parseYaml text with
+              | Just y -> y
+              | None -> Yaml.Hash [])
+         | Err _ -> Yaml.Hash [])
+    | None -> Yaml.Hash []
+  in
+  let forceUpdate = getEnv "INSTA_FORCE_UPDATE" == Just "1" or getEnv "INSTA_FORCE_UPDATE_SNAPSHOTS" == Just "1" in
+  let configUpdate =
+    match resolve ["behavior", "update"] config with
+    | Just y ->
+        (match asString y with
+         | Just s -> s
+         | None -> "auto")
+    | None ->
+        match resolve ["behavior", "force_update"] config with
+        | Just (Yaml.Boolean True) -> "force"
+        | _ -> "auto"
+  in
+  let updateText =
+    if forceUpdate
+    then "force"
+    else
+      match getEnv "INSTA_UPDATE" with
+      | None -> configUpdate
+      | Just "" -> configUpdate
+      | Just v -> v
+  in
+  let outputText = envText "INSTA_OUTPUT" config ["behavior", "output"] "diff" in
+  let output =
+    if outputText == "diff"
+    then Ok OutputBehavior.Diff
+    else if outputText == "summary"
+    then Ok OutputBehavior.Summary
+    else if outputText == "minimal"
+    then Ok OutputBehavior.Minimal
+    else if outputText == "none"
+    then Ok OutputBehavior.Nothing
+    else Err "invalid value for env var 'INSTA_OUTPUT'"
+  in
+  let update =
+    if updateText == "auto"
+    then Ok SnapshotUpdate.Auto
+    else if updateText == "always" or updateText == "1"
+    then Ok SnapshotUpdate.Always
+    else if updateText == "new"
+    then Ok SnapshotUpdate.New
+    else if updateText == "unseen"
+    then Ok SnapshotUpdate.Unseen
+    else if updateText == "no"
+    then Ok SnapshotUpdate.No
+    else if updateText == "force"
+    then Ok SnapshotUpdate.Force
+    else Err "invalid value for env var 'INSTA_UPDATE'"
+  in
+  let fullMatch = envFlag "INSTA_REQUIRE_FULL_MATCH" config ["behavior", "require_full_match"] in
+  let forcePass = envFlag "INSTA_FORCE_PASS" config ["behavior", "force_pass"] in
+  match (fullMatch, forcePass) with
+  | (Ok full, Ok force) ->
+      (match (output, update) with
+       | (Ok o, Ok u) -> Ok (ToolConfig { forcePass = force, requireFullMatch = full, output = o, update = u })
+       | (Err e, _) -> Err e
+       | (_, Err e) -> Err e)
+  | (Err e, _) -> Err e
+  | (_, Err e) -> Err e
+
+-- Whether this looks like a CI run: `CI` set to anything but `false`, `0` or
+-- nothing, or `TF_BUILD` set.
+@pub fun isCi () =
+  match getEnv "CI" with
+  | Just "false" -> False
+  | Just "0" -> False
+  | Just "" -> False
+  | None -> getEnv "TF_BUILD" != None
+  | Just _ -> True
+
+data UpdateBehavior = InPlace | NewFile | NoUpdate
+
+fun updateBehavior (c : ToolConfig) unseen =
+  match c.update with
+  | SnapshotUpdate.Always -> UpdateBehavior.InPlace
+  | SnapshotUpdate.Auto -> if isCi () then UpdateBehavior.NoUpdate else UpdateBehavior.NewFile
+  | SnapshotUpdate.Unseen -> if unseen then UpdateBehavior.NewFile else UpdateBehavior.InPlace
+  | SnapshotUpdate.New -> UpdateBehavior.NewFile
+  | SnapshotUpdate.No -> UpdateBehavior.NoUpdate
+  | SnapshotUpdate.Force -> UpdateBehavior.InPlace
+
+-- --- settings ------------------------------------------------------------------------------
+
+-- Where snapshots go, and what they record.
+@pub record Settings = {
+  -- The directory paths are relative to: `.` unless `INSTA_WORKSPACE_ROOT`
+  -- says otherwise.
+  workspace : String,
+  -- The test's file, relative to the workspace. Its directory holds the
+  -- snapshots, and it is recorded as the snapshot's source.
+  sourceFile : Maybe String,
+  -- The snapshots' directory, under the test file's.
+  snapshotPath : String,
+  -- A module name to begin each file name with, as `module__name.snap`.
+  modulePath : Maybe String,
+  -- Added to each snapshot's name, as `name@suffix`.
+  snapshotSuffix : Maybe String,
+  description : Maybe String,
+  info : Maybe Yaml,
+  omitExpression : Bool,
+  inputFile : Maybe String,
+  -- The assertion's line, if the caller knows it.
+  line : Maybe Int,
+  -- Whether to print colours.
+  colors : Bool,
+  width : Int,
+  -- What to say when a new snapshot was stored.
+  reviewHint : String,
+  -- What to say when an assertion fails.
+  stopHint : String
+}
+
+-- The defaults.
+@pub fun settings () =
+  Settings {
+    workspace =
+      match getEnv "INSTA_WORKSPACE_ROOT" with
+      | Just root -> root
+      | None -> ".",
+    sourceFile = None,
+    snapshotPath = "snapshots",
+    modulePath = None,
+    snapshotSuffix = None,
+    description = None,
+    info = None,
+    omitExpression = False,
+    inputFile = None,
+    line = None,
+    colors = getEnv "CLICOLOR_FORCE" != None and getEnv "CLICOLOR_FORCE" != Just "0",
+    width = 80,
+    reviewHint = "To update snapshots, accept the .snap.new files, or run the tests with INSTA_UPDATE=always",
+    stopHint = "Stopped on the first failure."
+  }
+
+fun joinPath base rest =
+  if base == "" or base == "." or S.startsWith "/" rest
+  then rest
+  else if S.endsWith "/" base
+  then base ++ rest
+  else base ++ "/" ++ rest
+
+fun parentOf path =
+  match lastSlash path with
+  | Just at -> S.take path at
+  | None -> ""
+
+fun lastSlash path =
+  let rec go from found =
+    match S.indexOfFrom "/" path from with
+    | Just at -> go (at + 1) (Just at)
+    | None -> found
+  in
+  go 0 None
+
+fun replaceAll from to text = S.join to (S.split from text)
+
+-- The name a snapshot is stored under: `name`, with the suffix.
+@pub fun snapshotName (s : Settings) name =
+  match s.snapshotSuffix with
+  | Just suffix -> "${name}@${suffix}"
+  | None -> name
+
+-- The `.snap` file for the snapshot `name`, relative to the working
+-- directory.
+@pub fun snapshotFile (s : Settings) name =
+  let dir =
+    match s.sourceFile with
+    | Just f -> joinPath (joinPath s.workspace (parentOf f)) s.snapshotPath
+    | None -> joinPath s.workspace s.snapshotPath
+  in
+  let prefix =
+    match s.modulePath with
+    | Just m -> replaceAll "::" "__" m ++ "__"
+    | None -> ""
+  in
+  let fileName = prefix ++ replaceAll "\\" "__" (replaceAll "/" "__" (snapshotName s name)) ++ ".snap" in
+  joinPath dir fileName
+
+-- `INSTA_PENDING_DIR`, if set, holds new snapshots in place of the snapshot
+-- directories, at the same paths under it.
+fun pendingPath workspace path =
+  match getEnv "INSTA_PENDING_DIR" with
+  | Just dir ->
+      if dir == ""
+      then path
+      else
+        let relative = if workspace == "." then path else S.drop path (stringByteLength workspace + 1) in
+        joinPath dir relative
+  | None -> path
+
+fun newPath path = if S.endsWith ".snap" path then path ++ ".new" else path ++ ".snap.new"
+
+-- --- asserting -----------------------------------------------------------------------------
+
+fun say (s : Settings) (c : ToolConfig) line =
+  if c.output == OutputBehavior.Nothing then () else writeOutput (line ++ "\n")
+
+fun styled (s : Settings) code text = if s.colors then "\u{1b}[${code}m${text}\u{1b}[0m" else text
+
+fun writeSnapshot path text =
+  let _ = createDirAll (parentOf path) in
+  writeString (path, text)
+
+fun literalBlocks () = getEnv "INSTA_YAML_BLOCK_STYLE" == Just "1"
+
+-- Writes `new` as the environment says, and says which it did.
+fun update (s : Settings) (c : ToolConfig) file new =
+  let unseen =
+    match file with
+    | Just f -> exists f
+    | None -> False
+  in
+  let behavior =
+    match (updateBehavior c unseen, file) with
+    | (UpdateBehavior.InPlace, None) -> UpdateBehavior.NewFile
+    | (b, _) -> b
+  in
+  let (n : Snapshot) = new in
+  match (behavior, file) with
+  | (UpdateBehavior.InPlace, Just f) ->
+      let _ = writeSnapshot f (serialize (literalBlocks ()) n (forPersistence n.metadata)) in
+      let _ = say s c ("${styled s "32" "updated snapshot"} ${styled s "36m\u{1b}[4" f}") in
+      behavior
+  | (UpdateBehavior.NewFile, Just f) ->
+      let target = newPath (pendingPath s.workspace f) in
+      let _ = writeSnapshot target (serialize (literalBlocks ()) n n.metadata) in
+      let _ = say s c ("${styled s "32" "stored new snapshot"} ${styled s "36m\u{1b}[4" target}") in
+      behavior
+  | (UpdateBehavior.NewFile, None) ->
+      let _ = say s c ("New inline value: " ++ meadowLiteral (contentsText n.contents)) in
+      behavior
+  | _ -> behavior
+
+-- `text` as a Meadow string literal, for pasting into a test.
+@pub fun meadowLiteral text =
+  let escape = \c ->
+    let cp = charCode c in
+    if cp == 34
+    then "\\\""
+    else if cp == 92
+    then "\\\\"
+    else if cp == 36
+    then "\\$"
+    else if cp == 10
+    then "\\n"
+    else if cp == 13
+    then "\\r"
+    else if cp == 9
+    then "\\t"
+    else if cp < 32 or cp == 127
+    then "\\u{${hexOf cp}}"
+    else charsToString #[c]
+  in
+  "\"" ++ S.join "" (V.map escape (V.fromArray (stringToChars text))) ++ "\""
+
+fun hexOf n =
+  let digits = "0123456789ABCDEF" in
+  let rec go m acc = if m == 0 then acc else go (m / 16) (stringSlice digits (m % 16) (m % 16 + 1) ++ acc) in
+  if n == 0 then "0" else go n ""
+
+fun report (s : Settings) (c : ToolConfig) old new file =
+  let base = printer s.workspace old new in
+  let (n : Snapshot) = new in
+  let sourceExists =
+    match n.metadata.source with
+    | Just src -> exists (joinPath s.workspace src)
+    | None -> False
+  in
+  let p =
+    { base |
+      line = s.line,
+      snapshotFile = file,
+      title = Just "Snapshot Summary",
+      showInfo = True,
+      colors = s.colors,
+      width = s.width,
+      sourceExists = sourceExists }
+  in
+  match c.output with
+  | OutputBehavior.Summary -> writeOutput (printedText p)
+  | OutputBehavior.Diff -> writeOutput (printedText { p | showDiff = True })
+  | _ -> ()
+
+fun finish (s : Settings) (c : ToolConfig) name behavior =
+  let hint = \text -> if s.colors then "\u{1b}[2m${text}\u{1b}[0m" else text in
+  let _ =
+    if behavior == UpdateBehavior.NewFile and c.output != OutputBehavior.Nothing
+    then writeOutput (hint s.reviewHint ++ "\n")
+    else ()
+  in
+  if behavior != UpdateBehavior.InPlace and not c.forcePass
+  then
+    let _ = if c.output != OutputBehavior.Nothing then writeOutput (hint s.stopHint ++ "\n") else () in
+    let label =
+      match name with
+      | Just n -> n
+      | None -> "unnamed snapshot"
+    in
+    let at =
+      match s.line with
+      | Just l -> " in line ${l}"
+      | None -> ""
+    in
+    fail "snapshot assertion for '${label}' failed${at}"
+  else ()
+
+fun metadataFor (s : Settings) expression =
+  MetaData {
+    source = s.sourceFile,
+    assertionLine = s.line,
+    description = s.description,
+    expression = if s.omitExpression then None else expression,
+    info = s.info,
+    inputFile = s.inputFile
+  }
+
+fun moduleOf (s : Settings) =
+  match s.modulePath with
+  | Just m -> replaceAll "::" "__" m
+  | None -> ""
+
+-- Asserts that `value` matches the snapshot `name`, as `settings` place it.
+-- `expression` is recorded as what was snapshotted.
+@pub fun assertSnapshotWith (s : Settings) name expression value =
+  match toolConfig s.workspace with
+  | Err e -> fail e
+  | Ok (c : ToolConfig) ->
+      let stored = snapshotName s name in
+      let file = snapshotFile s name in
+      let old =
+        if exists file
+        then
+          match readToString file with
+          | Ok text ->
+              let _ =
+                if isLegacySnapshot text
+                then
+                  writeOutput
+                  ("A snapshot uses a legacy snapshot format; please update it to the new format with "
+                    ++ "`cargo insta test --force-update-snapshots --accept`.\nSnapshot is at: ${file}\n")
+                else ()
+              in
+              (match parseSnapshot file text with
+               | Ok o -> Just o
+               | Err e ->
+                   let warning = if s.colors then "\u{1b}[33m\u{1b}[1mwarning\u{1b}[0m" else "warning" in
+                   let _ =
+                     let failed = "Failed to parse snapshot file; a new snapshot will be generated" in
+                     writeOutput ("${warning}: ${failed}: ${file}\n  Error: ${e}\n")
+                   in
+                   None)
+          | Err _ -> None
+        else None
+      in
+      let new =
+        Snapshot {
+          moduleName = moduleOf s,
+          snapshotName = Just stored,
+          metadata = metadataFor s expression,
+          contents = contents value TextKind.File
+        }
+      in
+      let passes =
+        match old with
+        | Just (o : Snapshot) ->
+            if c.requireFullMatch then snapshotsMatchFully o new else matches o.contents new.contents
+        | None -> False
+      in
+      if passes
+      then
+        let pending = newPath (pendingPath s.workspace file) in
+        let _ = if exists pending then removeFile pending else Ok () in
+        if c.update == SnapshotUpdate.Force then let _ = update s c (Just file) new in () else ()
+      else
+        let _ = report s c old new (Just file) in
+        let behavior = update s c (Just file) new in
+        finish s c (Just stored) behavior
+
+-- Asserts that `value` matches the snapshot `name`, with the default
+-- settings.
+@pub fun assertSnapshot name value = assertSnapshotWith (settings ()) name (Just name) value
+
+-- Asserts that `value` matches `reference`, a snapshot written in the test.
+-- A mismatch prints the new value as a literal to paste in.
+@pub fun assertInlineSnapshotWith (s : Settings) expression value reference =
+  match toolConfig s.workspace with
+  | Err e -> fail e
+  | Ok (c : ToolConfig) ->
+      let unnamed = \m c -> Snapshot { moduleName = moduleOf s, snapshotName = None, metadata = m, contents = c } in
+      let old = unnamed noMetadata (fromInlineLiteral reference) in
+      let new = unnamed (metadataFor s expression) (contents value TextKind.Inline) in
+      let passes = if c.requireFullMatch then snapshotsMatchFully old new else matches old.contents new.contents in
+      if passes
+      then ()
+      else
+        let _ = report s c (Just old) new None in
+        let behavior = update s c None new in
+        finish s c None behavior
+
+@pub fun assertInlineSnapshot value reference = assertInlineSnapshotWith (settings ()) None value reference
+
+-- Accepts every pending snapshot under `dir`: each `name.snap.new` becomes
+-- `name.snap`. Returns how many there were.
+@pub fun acceptPending dir =
+  let entries =
+    match readDir dir with
+    | Ok names -> names
+    | Err _ -> V.empty
+  in
+  V.foldl
+    (\count entry ->
+      let path = joinPath dir entry in
+      if S.endsWith ".snap.new" entry
+      then
+        let _ = rename (path, S.take path (stringByteLength path - 4)) in
+        count + 1
+      else if not (S.contains "." entry)
+      then count + acceptPending path
+      else count)
+    0
+    entries
