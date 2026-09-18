@@ -5,12 +5,14 @@ version = 1
 
 [[package]]
 name = "diff"
-source = "git+https://github.com/mcdearman/meadow-diff"
-rev = "f30ed4b1a5c0e4c0ae0d6ca32e8dff65859a669a"
-tree = "0efee6e3b5aec4bc65981ab37c49f8686a9dfdc4"
+source = "git+https://github.com/mcdearman/meadow-diff?version=0.1.0"
+version = "0.1.0"
+rev = "c3f6953feeab979c2be2af644c0a8d40cdba57ac"
+tree = "4ee95661a6d165028053de2f3f60a0fec67be01a"
 
 [[package]]
 name = "unicodeSegmentation"
-source = "git+https://github.com/mcdearman/meadow-unicode-segmentation"
+source = "git+https://github.com/mcdearman/meadow-unicode-segmentation?version=0.1.0"
+version = "0.1.0"
 rev = "848d1f524b6fa9db311785f88281e39c219b5fd6"
 tree = "f52a0267c7401a9a96772af58895c09cdd21bb9e"

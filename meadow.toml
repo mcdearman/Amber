@@ -3,4 +3,4 @@ name = "insta"
 version = "0.1.0"
 
 [dependencies]
-diff = { git = "https://github.com/mcdearman/meadow-diff" }
+diff = { git = "https://github.com/mcdearman/meadow-diff", version = "0.1.0" }
