@@ -3,4 +3,4 @@ name = "insta"
 version = "0.1.0"
 
 [dependencies]
-diff = { path = "../meadow-diff" }
+diff = { git = "https://github.com/mcdearman/meadow-diff" }
