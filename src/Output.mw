@@ -7,10 +7,10 @@
 
 use Std.Collections.Vector as V
 use Std.String as S
-use diff (diffLines, textDiffConfig, groupedOps, iterInlineChangesByWords, InlineChange, inlineMissingNewline, Patience)
-use diff (ChangeTag, DiffOp)
-use insta.Yaml (toYaml)
-use insta.Snapshot
+use Diff (diffLines, textDiffConfig, groupedOps, iterInlineChangesByWords, InlineChange, inlineMissingNewline, Patience)
+use Diff (ChangeTag, DiffOp)
+use Insta.Yaml (toYaml)
+use Insta.Snapshot
 
 -- --- styles --------------------------------------------------------------------------------
 

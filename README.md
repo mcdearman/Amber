@@ -15,13 +15,13 @@ This package is a port of Rust's [`insta`](https://github.com/mitsuhiko/insta)
 ## Install
 
 ```sh
-meadow add mcdearman/meadow-insta
+meadow add mcdearman/MeadowInsta
 ```
 
 ## Use
 
 ```meadow
-use insta (assertSnapshot, assertInlineSnapshot)
+use Insta (assertSnapshot, assertInlineSnapshot)
 
 fun report n = "total: ${n}\nitems:\n  - apples\n  - pears\n"
 
