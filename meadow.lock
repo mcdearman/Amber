@@ -6,13 +6,13 @@ version = 1
 [[package]]
 name = "Diff"
 source = "git+https://github.com/mcdearman/Diff?version=0.2.0"
-version = "0.2.0"
-rev = "228e08ffdf916e9de5a5791a64681db4c392b678"
-tree = "50b8597b7d925c476c854fe50978093d73e85e6e"
+version = "0.2.1"
+rev = "6f8a9681455d290873f114b8ff8e1c5272b65159"
+tree = "93164c0f260bd591b8a6f587fa2c841ccb86bc7a"
 
 [[package]]
 name = "UnicodeSegmentation"
-source = "git+https://github.com/mcdearman/MeadowUnicodeSegmentation?version=0.2.0"
-version = "0.2.0"
-rev = "8d4055797df0928c16c55eac1c0b66f080b29f01"
-tree = "6768f691b32e4154a397832b892e18596ab4687c"
+source = "git+https://github.com/mcdearman/UnicodeSegmentation?version=0.2.0"
+version = "0.2.1"
+rev = "33498ab064451b59be3a455dcb2ec865fe71290a"
+tree = "fcaabaabf36251e88ba26c1c0f731246fce1a193"

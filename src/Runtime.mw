@@ -19,9 +19,11 @@ use Amber.Output
 -- --- configuration -------------------------------------------------------------------------
 
 -- `INSTA_UPDATE`: when to write a changed snapshot.
+@derive(PartialEq)
 @pub data SnapshotUpdate = Always | Auto | Unseen | New | No | Force
 
 -- `INSTA_OUTPUT`: how much to print about a failure.
+@derive(PartialEq)
 @pub data OutputBehavior = Diff | Summary | Minimal | Nothing
 
 -- The run's settings, from the environment and the workspace's `insta.yaml`.
@@ -156,6 +158,7 @@ fun envText name config path fallback =
   | None -> getEnv "TF_BUILD" != None
   | Just _ -> True
 
+@derive(PartialEq)
 data UpdateBehavior = InPlace | NewFile | NoUpdate
 
 fun updateBehavior (c : ToolConfig) unseen =

@@ -1,6 +1,6 @@
 [package]
 name = "Amber"
-version = "0.2.0"
+version = "0.2.1"
 
 [dependencies]
 Diff = { git = "https://github.com/mcdearman/Diff", version = "0.2.0" }

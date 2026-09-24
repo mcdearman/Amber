@@ -240,6 +240,7 @@ fun rustDebug text =
 -- --- metadata ------------------------------------------------------------------------------
 
 -- What a snapshot records about where it came from.
+@derive(PartialEq)
 @pub record MetaData = {
   source : Maybe String,
   assertionLine : Maybe Int,
