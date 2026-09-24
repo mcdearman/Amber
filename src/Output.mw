@@ -9,8 +9,8 @@ use Std.Collections.Vector as V
 use Std.String as S
 use Diff (diffLines, textDiffConfig, groupedOps, iterInlineChangesByWords, InlineChange, inlineMissingNewline, Patience)
 use Diff (ChangeTag, DiffOp)
-use Insta.Yaml (toYaml)
-use Insta.Snapshot
+use Amber.Yaml (toYaml)
+use Amber.Snapshot
 
 -- --- styles --------------------------------------------------------------------------------
 

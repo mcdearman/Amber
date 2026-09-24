@@ -6,7 +6,7 @@
 
 use Std.Collections.Vector as V
 use Std.String as S
-use Insta.Yaml
+use Amber.Yaml
 
 -- --- contents ------------------------------------------------------------------------------
 

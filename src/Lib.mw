@@ -3,7 +3,7 @@
 -- A port of Rust's `insta` crate, version 1.48.0: its `.snap` files, its
 -- `INSTA_*` settings and its diffs.
 --
---   use Insta (assertSnapshot)
+--   use Amber (assertSnapshot)
 --
 --   @test fun rendersTheReport () = assertSnapshot "report" (render report)
 --
@@ -20,9 +20,9 @@ mod Cases
 @cfg(test)
 mod Tests
 
-@pub use Insta.Yaml
-@pub use Insta.Yaml.Yaml.*
-@pub use Insta.Snapshot
-@pub use Insta.Snapshot.TextKind.*
-@pub use Insta.Output
-@pub use Insta.Runtime
+@pub use Amber.Yaml
+@pub use Amber.Yaml.Yaml.*
+@pub use Amber.Snapshot
+@pub use Amber.Snapshot.TextKind.*
+@pub use Amber.Output
+@pub use Amber.Runtime

@@ -12,9 +12,9 @@ use Std.String as S
 use Std.Fs (readToString, writeString, createDirAll, removeFile, exists, readDir, rename)
 use Std.Console (writeOutput)
 use Std.Test (fail)
-use Insta.Yaml
-use Insta.Snapshot
-use Insta.Output
+use Amber.Yaml
+use Amber.Snapshot
+use Amber.Output
 
 -- --- configuration -------------------------------------------------------------------------
 

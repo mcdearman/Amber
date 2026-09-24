@@ -1,6 +1,6 @@
 [package]
-name = "Insta"
+name = "Amber"
 version = "0.2.0"
 
 [dependencies]
-Diff = { git = "https://github.com/mcdearman/MeadowDiff", version = "0.2.0" }
+Diff = { git = "https://github.com/mcdearman/Diff", version = "0.2.0" }

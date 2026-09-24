@@ -5,7 +5,7 @@ version = 1
 
 [[package]]
 name = "Diff"
-source = "git+https://github.com/mcdearman/MeadowDiff?version=0.2.0"
+source = "git+https://github.com/mcdearman/Diff?version=0.2.0"
 version = "0.2.0"
 rev = "228e08ffdf916e9de5a5791a64681db4c392b678"
 tree = "50b8597b7d925c476c854fe50978093d73e85e6e"

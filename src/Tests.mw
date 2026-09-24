@@ -15,13 +15,13 @@ use Std.Fs (writeString, createDirAll, removeDirAll, readToString, exists)
 @cfg(test)
 use Std.Console (withOutput)
 @cfg(test)
-use Insta.Cases (cases)
+use Amber.Cases (cases)
 @cfg(test)
-use Insta.Yaml
+use Amber.Yaml
 @cfg(test)
-use Insta.Snapshot
+use Amber.Snapshot
 @cfg(test)
-use Insta.Runtime
+use Amber.Runtime
 
 -- --- reading -------------------------------------------------------------------------------
 

@@ -1,4 +1,4 @@
-# insta
+# amber
 
 Snapshot testing for [Meadow](https://github.com/mcdearman/meadow). A test
 asserts that a value matches the snapshot stored for it. When the value
@@ -15,13 +15,13 @@ This package is a port of Rust's [`insta`](https://github.com/mitsuhiko/insta)
 ## Install
 
 ```sh
-meadow add mcdearman/MeadowInsta
+meadow add mcdearman/Amber
 ```
 
 ## Use
 
 ```meadow
-use Insta (assertSnapshot, assertInlineSnapshot)
+use Amber (assertSnapshot, assertInlineSnapshot)
 
 fun report n = "total: ${n}\nitems:\n  - apples\n  - pears\n"
 
